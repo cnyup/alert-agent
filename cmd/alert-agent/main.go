@@ -20,10 +20,12 @@ import (
 
 	"github.com/cnyup/alert-agent/internal/agent"
 	"github.com/cnyup/alert-agent/internal/config"
+	"github.com/cnyup/alert-agent/internal/feishu"
 	"github.com/cnyup/alert-agent/internal/llm"
 	mcpagent "github.com/cnyup/alert-agent/internal/mcp"
 	_ "github.com/cnyup/alert-agent/internal/notifier" // 注册内置通知器（log + feishu-card）
 	"github.com/cnyup/alert-agent/internal/pipeline"
+	"github.com/cnyup/alert-agent/internal/policy"
 	"github.com/cnyup/alert-agent/internal/skills"
 	"github.com/cnyup/alert-agent/internal/store"
 	"github.com/cnyup/alert-agent/pkg/model"
@@ -133,7 +135,50 @@ func main() {
 			slog.Warn("通知器装配失败，已跳过", "type", nc.Type, "err", err)
 			continue
 		}
+		// 卡片发送回调：记录 message_id → event_id 映射（回复卡片驱动闭环指令）
+		if setter, ok := n.(interface{ SetOnSent(func(string, string)) }); ok {
+			setter.SetOnSent(func(eventID, messageID string) {
+				if err := st.SaveCardRef(context.Background(), eventID, messageID); err != nil {
+					slog.Error("卡片映射落库失败", "err", err)
+				}
+			})
+		}
 		notifiers = append(notifiers, n)
+	}
+
+	// P1 审批状态机：执行器在已装配的 MCP 工具集中按名查找
+	var execTools []tool.BaseTool
+	if diagnoser != nil {
+		execTools = diagnoser.Tools()
+	}
+	policyMgr := policy.New(st, func(ctx context.Context, toolName, argsJSON string) (string, error) {
+		for _, t := range execTools {
+			info, err := t.Info(ctx)
+			if err != nil || info == nil || info.Name != toolName {
+				continue
+			}
+			inv, ok := t.(tool.InvokableTool)
+			if !ok {
+				return "", fmt.Errorf("工具 %s 不可调用", toolName)
+			}
+			return inv.InvokableRun(ctx, argsJSON)
+		}
+		return "", fmt.Errorf("工具 %s 未装配（检查 mcp.servers 或工具名）", toolName)
+	})
+	decideHandler := func(ctx context.Context, value map[string]any, operator string) (string, error) {
+		kind, _ := value["type"].(string)
+		eventID, _ := value["event_id"].(string)
+		actionID, _ := value["action_id"].(string)
+		switch kind {
+		case "approve":
+			return policyMgr.Decide(ctx, eventID, actionID, true, operator)
+		case "reject":
+			return policyMgr.Decide(ctx, eventID, actionID, false, operator)
+		case "claim", "false-positive", "root-confirmed":
+			return policyMgr.Feedback(ctx, eventID, kind, operator)
+		default:
+			return "", fmt.Errorf("未知按钮类型 %q", kind)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -212,6 +257,10 @@ func main() {
 		slog.Info("排查完成", "id", evt.ID, "skill", skill.Name,
 			"summary", report.Summary, "needs_human", report.NeedsHuman,
 			"steps", report.Cost.Steps, "root_causes", len(report.RootCauses))
+		// P1：mutating 动作进入审批状态机（卡片按钮批准后才执行）
+		if err := policyMgr.CreateApprovals(ctx, report); err != nil {
+			slog.Error("审批创建失败", "id", evt.ID, "err", err)
+		}
 
 		// 通知：路由指定的目标优先，未指定则全部已装配通知器
 		targets := notifiers
@@ -235,6 +284,13 @@ func main() {
 		}
 		if m, ok := src.(interface{ SetMux(*http.ServeMux) }); ok {
 			m.SetMux(mux)
+		}
+		if f, ok := src.(interface {
+			SetDecisionHandler(feishu.DecisionHandler)
+			SetCardResolver(feishu.CardResolver)
+		}); ok {
+			f.SetDecisionHandler(decideHandler)
+			f.SetCardResolver(st.EventIDByCard)
 		}
 		go func(name string) {
 			if err := src.Start(ctx, func(ctx context.Context, evt *model.AlertEvent) error {

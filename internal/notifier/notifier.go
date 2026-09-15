@@ -38,7 +38,11 @@ func (*logNotifier) Notify(_ context.Context, report *model.DiagnosisReport) err
 type feishuCardNotifier struct {
 	appID, appSecret, chatID string
 	client                   *lark.Client
+	onSent                   func(eventID, messageID string) // 卡片 message_id → event_id 映射落库
 }
+
+// SetOnSent 装配期注入发送回调（闭环指令靠回复卡片消息关联事件）。
+func (f *feishuCardNotifier) SetOnSent(fn func(eventID, messageID string)) { f.onSent = fn }
 
 type feishuOptions struct {
 	AppID     string `json:"app_id"`
@@ -86,6 +90,9 @@ func (f *feishuCardNotifier) Notify(ctx context.Context, report *model.Diagnosis
 	if !resp.Success() {
 		return fmt.Errorf("feishu-card: 发送失败 code=%d msg=%s", resp.Code, resp.Msg)
 	}
+	if f.onSent != nil && resp.Data != nil && resp.Data.MessageId != nil {
+		f.onSent(report.AlertID, *resp.Data.MessageId)
+	}
 	slog.Info("飞书卡片已发送", "alert_id", report.AlertID, "chat_id", f.chatID)
 	return nil
 }
@@ -125,16 +132,24 @@ func buildReportCard(r *model.DiagnosisReport) (map[string]any, error) {
 		fmt.Fprintf(&md, "\n**未解之问**：%s", escape(strings.Join(r.Unresolved, "；")))
 	}
 
+	elements := []any{map[string]any{
+		"tag":  "div",
+		"text": map[string]any{"tag": "lark_md", "content": md.String()},
+	}}
+	// P1 双向闭环（回复消息驱动）：mutating 动作给出批准/拒绝指令格式
+	for _, a := range r.Actions {
+		if a.Risk == model.RiskMutating {
+			md.WriteString(fmt.Sprintf("\n**闭环指令**：回复本消息 \"批准 %s\" 或 \"拒绝 %s\"", a.ID, a.ID))
+		}
+	}
+	md.WriteString("\n**反馈**：回复本消息 \"认领\" / \"误报\" / \"根因确认\"")
 	return map[string]any{
 		"config": map[string]any{"wide_screen_mode": true},
 		"header": map[string]any{
 			"template": headerColor,
 			"title":    map[string]any{"tag": "plain_text", "content": fmt.Sprintf("%s 告警排查报告 · %s", emoji, r.Severity)},
 		},
-		"elements": []any{map[string]any{
-			"tag":  "div",
-			"text": map[string]any{"tag": "lark_md", "content": md.String()},
-		}},
+		"elements": elements,
 	}, nil
 }
 

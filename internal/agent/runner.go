@@ -49,6 +49,9 @@ const reportFormat = `
 
 硬约束：root_causes 每条必须引用证据链编号（T1、T2…）；无证据的猜测不得写入。`
 
+// Tools 返回排查内核持有的工具集（审批执行器按名查找用）。
+func (r *Runner) Tools() []tool.BaseTool { return r.tools }
+
 // Diagnose 对单条告警执行排查：注入剧本全文（第二阶段加载）→ 引擎执行 →
 // 解析并校验报告。skill 为 nil 时由调用方先落位通用兜底剧本。
 func (r *Runner) Diagnose(ctx context.Context, evt *coremodel.AlertEvent, skill *skills.Skill) (*coremodel.DiagnosisReport, []einoengine.Evidence, error) {
