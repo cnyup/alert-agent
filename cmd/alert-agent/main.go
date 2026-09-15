@@ -12,13 +12,17 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+
+	"github.com/cloudwego/eino/components/tool"
 
 	"github.com/cnyup/alert-agent/internal/agent"
 	"github.com/cnyup/alert-agent/internal/config"
 	"github.com/cnyup/alert-agent/internal/llm"
-	_ "github.com/cnyup/alert-agent/internal/notifier" // 注册 log 通知器
+	mcpagent "github.com/cnyup/alert-agent/internal/mcp"
+	_ "github.com/cnyup/alert-agent/internal/notifier" // 注册内置通知器（log + feishu-card）
 	"github.com/cnyup/alert-agent/internal/pipeline"
 	"github.com/cnyup/alert-agent/internal/skills"
 	"github.com/cnyup/alert-agent/internal/store"
@@ -45,6 +49,7 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+	loadDotEnv(filepath.Join(filepath.Dir(*configPath), ".env"))
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -106,7 +111,16 @@ func main() {
 		slog.Error("LLM 构造失败", "err", err)
 		os.Exit(1)
 	default:
-		diagnoser = agent.New(reasoner, nil, 12) // P0: MCP 工具接入前为空集
+		var agentTools []tool.BaseTool
+		if len(cfg.MCP.Servers) > 0 {
+			agentTools, err = mcpagent.BuildTools(ctx0(), cfg.MCP.Servers)
+			if err != nil {
+				slog.Error("MCP 工具装配失败", "err", err)
+				os.Exit(1)
+			}
+			slog.Info("MCP 工具就绪", "tools", mcpagent.ToolNames(agentTools))
+		}
+		diagnoser = agent.New(reasoner, agentTools, 12)
 		slog.Info("排查内核就绪")
 	}
 
@@ -115,8 +129,9 @@ func main() {
 	for _, nc := range cfg.Notifiers {
 		n, err := plugin.NewNotifier(nc.Type, nc.Options)
 		if err != nil {
-			slog.Error("通知器装配失败", "type", nc.Type, "err", err)
-			os.Exit(1)
+			// 通知器是非关键路径：凭证缺失等装配失败只告警跳过，不阻断主流程
+			slog.Warn("通知器装配失败，已跳过", "type", nc.Type, "err", err)
+			continue
 		}
 		notifiers = append(notifiers, n)
 	}
@@ -253,6 +268,29 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("已退出")
+}
+
+// ctx0 启动期用的基础 ctx。
+func ctx0() context.Context { return context.Background() }
+
+// loadDotEnv 极简 .env 装载（已存在的环境变量优先，不覆盖）。
+func loadDotEnv(path string) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok {
+			k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+			if os.Getenv(k) == "" {
+				_ = os.Setenv(k, v)
+			}
+		}
+	}
 }
 
 func filterNotifiers(all []plugin.Notifier, want []string) []plugin.Notifier {
