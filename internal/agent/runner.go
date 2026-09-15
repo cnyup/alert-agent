@@ -108,7 +108,8 @@ func (r *Runner) Diagnose(ctx context.Context, evt *coremodel.AlertEvent, skill 
 	return rep, out.Evidence, nil
 }
 
-// parseReport 解析最终回答（容忍 ```json 围栏）。
+// parseReport 解析最终回答。容忍三种包装：```json 围栏、前后缀说明文字
+// （实测 Qwen 会输出"### 结论 ### 输出 {…}"式结构）、裸 JSON。
 func parseReport(content string) (*coremodel.DiagnosisReport, error) {
 	s := strings.TrimSpace(content)
 	if strings.HasPrefix(s, "```") {
@@ -117,11 +118,52 @@ func parseReport(content string) (*coremodel.DiagnosisReport, error) {
 		}
 		s = strings.TrimSuffix(strings.TrimSpace(s), "```")
 	}
+	// 直接解析
 	var rep coremodel.DiagnosisReport
-	if err := json.Unmarshal([]byte(s), &rep); err != nil {
-		return nil, err
+	if err := json.Unmarshal([]byte(s), &rep); err == nil {
+		return &rep, nil
 	}
-	return &rep, nil
+	// 从首个 { 起提取配平的 JSON 对象（跳过前后缀文字）
+	if i := strings.Index(s, "{"); i >= 0 {
+		if obj, ok := extractBalancedJSON(s[i:]); ok {
+			rep = coremodel.DiagnosisReport{}
+			if err := json.Unmarshal([]byte(obj), &rep); err == nil {
+				return &rep, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("内容中未找到合法报告 JSON")
+}
+
+// extractBalancedJSON 提取首个配平的 {...}（处理字符串内的花括号与转义）。
+func extractBalancedJSON(s string) (string, bool) {
+	depth, inStr, esc := 0, false, false
+	for i, r := range s {
+		if esc {
+			esc = false
+			continue
+		}
+		switch r {
+		case '\\':
+			if inStr {
+				esc = true
+			}
+		case '"':
+			inStr = !inStr
+		case '{':
+			if !inStr {
+				depth++
+			}
+		case '}':
+			if !inStr {
+				depth--
+				if depth == 0 {
+					return s[:i+1], true
+				}
+			}
+		}
+	}
+	return "", false
 }
 
 func truncate(s string, n int) string {
