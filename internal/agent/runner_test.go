@@ -146,3 +146,21 @@ func TestDiagnoseBudgetCap(t *testing.T) {
 		t.Fatal("预算触顶应报错")
 	}
 }
+
+// 实测回归：Qwen 会把报告 JSON 包在 markdown 说明文字里
+func TestParseReportProseWrapped(t *testing.T) {
+	content := "### 结论\n根据以上排查结果，问题与发布时间吻合。\n\n### 输出\n{\n  \"summary\": \"发布引入\",\n  \"root_causes\": [{\"hypothesis\": \"h\", \"confidence\": 0.9, \"evidence\": [\"T1\"]}]\n}\n以上。"
+	rep, err := parseReport(content)
+	if err != nil {
+		t.Fatalf("说明文字包裹的 JSON 应可解析: %v", err)
+	}
+	if rep.Summary != "发布引入" || len(rep.RootCauses) != 1 || rep.RootCauses[0].Evidence[0] != "T1" {
+		t.Fatalf("解析结果不符: %+v", rep)
+	}
+	// 字符串内含花括号不干扰配平
+	tricky := `前缀 {"summary": "a{b}c{\"k\":1}", "needs_human": false} 后缀}`
+	rep2, err := parseReport(tricky)
+	if err != nil || rep2.Summary != `a{b}c{"k":1}` {
+		t.Fatalf("花括号转义场景失败: %v %+v", err, rep2)
+	}
+}
