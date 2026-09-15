@@ -1,10 +1,13 @@
-# 冒烟测试配置（远程 /root/code/alert-agent 下使用）
+# 冒烟测试配置（凭证走同目录 .env，不落 git）
 server:
   addr: ":18080"
 
 llm:
   router: {}
-  reasoner: {}
+  reasoner:
+    base_url: ${LLM_REASONER_BASE_URL}
+    model: ${LLM_REASONER_MODEL}
+    api_key: ${LLM_REASONER_API_KEY}
 
 sources:
   - type: webhook
@@ -21,23 +24,25 @@ pipeline:
       - name: order-prod
         match: { service: order-api, env: prod }
         severity: critical
-        skills: [http-5xx-spike, k8s-crashloop]
-        notifiers: [feishu-card]
-      - name: db-warning
-        match: { component: postgres }
-        severity: warning
-        skills: [pg-conn-exhaust]
+        skills: [http-5xx-spike]
+        notifiers: [feishu-card, log]
 
 skills:
   dir: ./skills/examples
 
 mcp:
-  servers: {}
+  servers:
+    stub:
+      command: ./bin/mcp-stub
 
 policy:
   execution: suggest-only
 
 notifiers:
+  - type: feishu-card
+    app_id: ${FEISHU_APP_ID}
+    app_secret: ${FEISHU_APP_SECRET}
+    chat_id: ${FEISHU_CHAT_ID}
   - type: log
 
 store:
