@@ -1,0 +1,48 @@
+# alert-agent 配置入口（示例）
+# 凭证一律走 ${ENV_VAR} 展开，不落盘。
+
+server:
+  addr: ":8080"
+
+llm:
+  router:                              # 分类/选剧本（小模型）
+    base_url: ${LLM_ROUTER_BASE_URL}
+    model: ${LLM_ROUTER_MODEL}
+    api_key: ${LLM_ROUTER_API_KEY}
+  reasoner:                            # 排查主力（大模型）
+    base_url: ${LLM_REASONER_BASE_URL}
+    model: ${LLM_REASONER_MODEL}
+    api_key: ${LLM_REASONER_API_KEY}
+
+sources:
+  - type: webhook
+    path: /hooks/alertmanager
+    parse: alertmanager                # 内置解析器：alertmanager / grafana / jmespath / regex
+
+pipeline:                              # 顺序可配、可增删
+  - stage: dedup
+    key: fingerprint
+    window: 5m
+  - stage: silence
+    match: "env=staging"
+  - stage: route
+    rules: []
+
+skills:
+  dir: ./skills
+
+mcp:
+  servers:
+    prometheus:
+      command: ./mcp-servers/prometheus
+      args: []
+
+policy:
+  execution: suggest-only              # suggest-only | approval-required | auto+whitelist
+
+notifiers:
+  - type: feishu-card
+    chat_id: ${FEISHU_CHAT_ID}
+
+store:
+  path: data/alert-agent.db
