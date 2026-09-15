@@ -1,0 +1,18 @@
+# build
+/bin/
+/dist/
+*.exe
+
+# test & coverage
+*.out
+coverage.*
+
+# runtime
+*.log
+*.db
+*.sqlite
+/data/
+
+# env & editor
+.env
+.DS_Store

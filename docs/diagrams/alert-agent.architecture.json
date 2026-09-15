@@ -1,0 +1,392 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "alert-agent 可插拔告警排查 Agent 架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1250,
+      650
+    ],
+    "views": [
+      {
+        "id": "intake-pipeline",
+        "label": "接入与管道",
+        "focus": [
+          "src_alerts",
+          "source_in",
+          "pipeline",
+          "store"
+        ],
+        "note": "任意告警源归一化为 AlertEvent，经确定性管道去重、静默与路由。"
+      },
+      {
+        "id": "diagnosis-kernel",
+        "label": "排查内核",
+        "focus": [
+          "skills",
+          "runner",
+          "eino",
+          "llm",
+          "mcp_servers"
+        ],
+        "note": "DiagnosisRunner 隔离层托管 Eino ReAct loop，按剧本收权调用 LLM 与 MCP 工具。"
+      },
+      {
+        "id": "human-loop",
+        "label": "策略与人机闭环",
+        "focus": [
+          "runner",
+          "policy",
+          "notifier",
+          "feishu_out"
+        ],
+        "note": "报告经策略层发出，飞书卡片按钮回调完成审批与反馈闭环。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "src_alerts",
+      "type": "external",
+      "label": "告警来源",
+      "sublabel": "飞书 · Alertmanager · Webhook",
+      "pos": [
+        24,
+        80
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "source_in",
+      "type": "backend",
+      "label": "Source 插件",
+      "sublabel": "归一化 → AlertEvent",
+      "pos": [
+        240,
+        80
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "pipeline",
+      "type": "backend",
+      "label": "Pipeline",
+      "sublabel": "dedup → silence → route",
+      "pos": [
+        462,
+        80
+      ],
+      "size": [
+        160,
+        64
+      ]
+    },
+    {
+      "id": "store",
+      "type": "database",
+      "label": "SQLite",
+      "sublabel": "events · traces · feedback",
+      "pos": [
+        694,
+        80
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "brand": "sqlite"
+    },
+    {
+      "id": "llm",
+      "type": "cloud",
+      "label": "LLM API",
+      "sublabel": "OpenAI 兼容 · 模型分级",
+      "pos": [
+        1000,
+        80
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "skills",
+      "type": "backend",
+      "label": "Skills 剧本",
+      "sublabel": "Markdown · 两阶段加载",
+      "pos": [
+        150,
+        285
+      ],
+      "size": [
+        150,
+        66
+      ],
+      "tag": "用户维护"
+    },
+    {
+      "id": "runner",
+      "type": "backend",
+      "label": "DiagnosisRunner",
+      "sublabel": "装配 · 收权 · 预算 · 证据链",
+      "pos": [
+        400,
+        285
+      ],
+      "size": [
+        170,
+        70
+      ]
+    },
+    {
+      "id": "eino",
+      "type": "backend",
+      "label": "Eino 内核",
+      "sublabel": "ReAct loop · callbacks",
+      "pos": [
+        650,
+        285
+      ],
+      "size": [
+        150,
+        66
+      ],
+      "tag": "隔离层"
+    },
+    {
+      "id": "mcp_servers",
+      "type": "external",
+      "label": "MCP Servers",
+      "sublabel": "Prometheus · K8s · DB",
+      "pos": [
+        1040,
+        285
+      ],
+      "size": [
+        160,
+        66
+      ],
+      "tag": "用户接入"
+    },
+    {
+      "id": "policy",
+      "type": "security",
+      "label": "策略层",
+      "sublabel": "suggest-only · 审批执行",
+      "pos": [
+        620,
+        495
+      ],
+      "size": [
+        160,
+        66
+      ]
+    },
+    {
+      "id": "notifier",
+      "type": "backend",
+      "label": "Notifier 插件",
+      "sublabel": "飞书卡片 · webhook",
+      "pos": [
+        880,
+        495
+      ],
+      "size": [
+        140,
+        66
+      ]
+    },
+    {
+      "id": "feishu_out",
+      "type": "external",
+      "label": "飞书闭环",
+      "sublabel": "认领 · 审批 · 反馈",
+      "pos": [
+        1085,
+        495
+      ],
+      "size": [
+        150,
+        66
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "alert-agent 框架（Go 单二进制）",
+      "wraps": [
+        "source_in",
+        "pipeline",
+        "store",
+        "skills",
+        "runner",
+        "eino",
+        "policy",
+        "notifier"
+      ],
+      "pad": 24
+    },
+    {
+      "kind": "security-group",
+      "label": "排查内核 · 可整体回退自研 loop",
+      "wraps": [
+        "runner",
+        "eino"
+      ],
+      "pad": 14
+    }
+  ],
+  "connections": [
+    {
+      "from": "src_alerts",
+      "to": "source_in",
+      "label": "多源告警",
+      "variant": "emphasis"
+    },
+    {
+      "from": "source_in",
+      "to": "pipeline",
+      "label": "AlertEvent"
+    },
+    {
+      "from": "pipeline",
+      "to": "store",
+      "label": "事件落库"
+    },
+    {
+      "from": "pipeline",
+      "to": "runner",
+      "label": "路由 · 选剧本",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        480,
+        215
+      ]
+    },
+    {
+      "from": "skills",
+      "to": "runner",
+      "label": "剧本注入",
+      "variant": "dashed"
+    },
+    {
+      "from": "runner",
+      "to": "eino",
+      "label": "托管 ReAct"
+    },
+    {
+      "from": "eino",
+      "to": "llm",
+      "label": "ChatModel 调用",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "via": [
+        [
+          725,
+          215
+        ],
+        [
+          1075,
+          215
+        ]
+      ],
+      "labelAt": [
+        900,
+        200
+      ]
+    },
+    {
+      "from": "eino",
+      "to": "mcp_servers",
+      "label": "工具调用 · MCP",
+      "labelAt": [
+        920,
+        305
+      ]
+    },
+    {
+      "from": "runner",
+      "to": "policy",
+      "label": "报告 + 证据链",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        590,
+        430
+      ]
+    },
+    {
+      "from": "policy",
+      "to": "notifier",
+      "label": "报告 · 审批"
+    },
+    {
+      "from": "notifier",
+      "to": "feishu_out",
+      "label": "卡片推送"
+    },
+    {
+      "from": "feishu_out",
+      "to": "policy",
+      "label": "按钮回调",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [
+        [
+          1160,
+          615
+        ],
+        [
+          700,
+          615
+        ]
+      ],
+      "labelAt": [
+        930,
+        600
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "混合架构",
+      "items": [
+        "管道确定性流转：dedup → silence → route，P2 引 xdag DAG 化",
+        "排查侧 Agent 按剧本执行，分支取决于观测结果",
+        "配置表达装配，代码表达行为"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "一切可插拔",
+      "items": [
+        "AlertEvent 统一事件模型，任意来源归一化接入",
+        "Skills 即 Markdown 剧本，生态互通",
+        "MCP 接入任意工具，LLM 走 OpenAI 兼容协议"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "信任与闭环",
+      "items": [
+        "结论强制引用工具调用编号，trace 可回放",
+        "mutating 动作一律走飞书审批卡片",
+        "反馈落库，P2 蒸馏为剧本修订建议"
+      ]
+    }
+  ]
+}
