@@ -152,11 +152,15 @@ func (s *source) onMessage(ctx context.Context, ev *larkim.P2MessageReceiveV1, e
 	// ② 普通消息 → 新告警：单聊直接响应；群聊要求 @机器人
 	if chatType == "group" {
 		if len(s.whitelist) > 0 && !s.whitelist[chatID] {
+			slog.Debug("飞书群消息忽略（不在白名单）", "chat", chatID)
 			return nil
 		}
 		if !strings.Contains(deref(msg.Content), "@_user_") {
+			slog.Info("飞书群消息忽略（未 @机器人）", "chat", chatID, "text", truncateRunes(text, 40))
 			return nil
 		}
+	} else {
+		slog.Info("飞书单聊消息", "chat", chatID, "text", truncateRunes(text, 40))
 	}
 	if strings.TrimSpace(text) == "" {
 		return nil
