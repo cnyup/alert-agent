@@ -1,6 +1,9 @@
-// Package plugin 定义三个插件契约（Source/Notifier/Stage）与编译期注册表。
-// Go 无动态加载：内置插件集在各自包的 init() 中注册（Terraform/Caddy 模式），
+// Package plugin 定义三个插件契约（Source/Notifier/Stage）与工厂注册表。
+// Go 无动态加载：内置插件集在各自包的 init() 中注册工厂（Terraform/Caddy 模式），
 // 用户长尾场景走 sidecar HTTP 对接（DESIGN.md §2.2 三层扩展模型）。
+//
+// 注册的是工厂而非实例：每个配置条目（如两个不同 path 的 webhook 源）
+// 各自实例化，插件选项在工厂内做强类型解码——插件实例不得依赖全局状态。
 package plugin
 
 import (
@@ -31,7 +34,7 @@ type Notifier interface {
 }
 
 // Action 管道阶段的处理结果——"跳过"是一等状态，不是失败
-// （借鉴 xdag 的 Skipped 语义：silence 命中、dedup 窗口内都返回 Skip）。
+// （借鉴 xdag 的 Skipped 语义：silence 命中、dedup 窗口内都返回 Skip/Drop）。
 type Action int
 
 const (
@@ -43,105 +46,115 @@ const (
 	ActionDrop
 )
 
-// Stage 管道阶段插件：顺序由配置装配，可增删。
+// Stage 管道阶段插件：顺序由配置装配，可增删。实例必须并发安全。
 type Stage interface {
 	Name() string
 	Process(ctx context.Context, evt *model.AlertEvent) (*model.AlertEvent, Action, error)
 }
 
+// 工厂：opts 来自配置文件中该条目的专属装配块（map 形式），
+// 由各插件自行做强类型解码——框架不理解插件的私有配置。
+type SourceFactory func(opts map[string]any) (Source, error)
+type NotifierFactory func(opts map[string]any) (Notifier, error)
+type StageFactory func(opts map[string]any) (Stage, error)
+
 var (
 	mu        sync.RWMutex
-	sources   = map[string]Source{}
-	notifiers = map[string]Notifier{}
-	stages    = map[string]Stage{}
+	sources   = map[string]SourceFactory{}
+	notifiers = map[string]NotifierFactory{}
+	stages    = map[string]StageFactory{}
 )
 
-// RegisterSource 编译期注册 Source 插件，重名直接 panic（启动期暴露装配错误）。
-func RegisterSource(s Source) {
+func register[T any](reg map[string]T, kind, name string, f T) {
+	if name == "" {
+		panic(fmt.Sprintf("plugin: %s 工厂名不能为空", kind))
+	}
+	if _, dup := reg[name]; dup {
+		panic(fmt.Sprintf("plugin: %s 工厂 %q 重复注册", kind, name))
+	}
+	reg[name] = f
+}
+
+// RegisterSourceFactory 注册 Source 工厂。
+func RegisterSourceFactory(name string, f SourceFactory) {
 	mu.Lock()
 	defer mu.Unlock()
-	if _, dup := sources[s.Name()]; dup {
-		panic(fmt.Sprintf("plugin: Source %q 重复注册", s.Name()))
-	}
-	sources[s.Name()] = s
+	register(sources, "Source", name, f)
 }
 
-// RegisterNotifier 编译期注册 Notifier 插件。
-func RegisterNotifier(n Notifier) {
+// RegisterNotifierFactory 注册 Notifier 工厂。
+func RegisterNotifierFactory(name string, f NotifierFactory) {
 	mu.Lock()
 	defer mu.Unlock()
-	if _, dup := notifiers[n.Name()]; dup {
-		panic(fmt.Sprintf("plugin: Notifier %q 重复注册", n.Name()))
-	}
-	notifiers[n.Name()] = n
+	register(notifiers, "Notifier", name, f)
 }
 
-// RegisterStage 编译期注册 Stage 插件。
-func RegisterStage(s Stage) {
+// RegisterStageFactory 注册 Stage 工厂。
+func RegisterStageFactory(name string, f StageFactory) {
 	mu.Lock()
 	defer mu.Unlock()
-	if _, dup := stages[s.Name()]; dup {
-		panic(fmt.Sprintf("plugin: Stage %q 重复注册", s.Name()))
+	register(stages, "Stage", name, f)
+}
+
+// NewSource 按注册名与配置实例化 Source。
+func NewSource(name string, opts map[string]any) (Source, error) {
+	mu.RLock()
+	f, ok := sources[name]
+	mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("plugin: Source %q 未注册", name)
 	}
-	stages[s.Name()] = s
+	return f(opts)
 }
 
-// LookupSource 按名查找（配置装配用），未注册返回 ok=false。
-func LookupSource(name string) (Source, bool) {
+// NewNotifier 按注册名与配置实例化 Notifier。
+func NewNotifier(name string, opts map[string]any) (Notifier, error) {
 	mu.RLock()
-	defer mu.RUnlock()
-	s, ok := sources[name]
-	return s, ok
+	f, ok := notifiers[name]
+	mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("plugin: Notifier %q 未注册", name)
+	}
+	return f(opts)
 }
 
-// LookupNotifier 按名查找。
-func LookupNotifier(name string) (Notifier, bool) {
+// NewStage 按注册名与配置实例化 Stage。
+func NewStage(name string, opts map[string]any) (Stage, error) {
 	mu.RLock()
-	defer mu.RUnlock()
-	n, ok := notifiers[name]
-	return n, ok
+	f, ok := stages[name]
+	mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("plugin: Stage %q 未注册", name)
+	}
+	return f(opts)
 }
 
-// LookupStage 按名查找。
-func LookupStage(name string) (Stage, bool) {
-	mu.RLock()
-	defer mu.RUnlock()
-	s, ok := stages[name]
-	return s, ok
+func sortedKeys[T any](m map[string]T) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
-// SourceNames 已注册的 Source 名单（诊断/启动日志用）。
+// SourceNames 已注册的 Source 工厂名单。
 func SourceNames() []string {
 	mu.RLock()
 	defer mu.RUnlock()
-	out := make([]string, 0, len(sources))
-	for n := range sources {
-		out = append(out, n)
-	}
-	sort.Strings(out)
-	return out
+	return sortedKeys(sources)
 }
 
-// NotifierNames 已注册的 Notifier 名单。
+// NotifierNames 已注册的 Notifier 工厂名单。
 func NotifierNames() []string {
 	mu.RLock()
 	defer mu.RUnlock()
-	out := make([]string, 0, len(notifiers))
-	for n := range notifiers {
-		out = append(out, n)
-	}
-	sort.Strings(out)
-	return out
+	return sortedKeys(notifiers)
 }
 
-// StageNames 已注册的 Stage 名单。
+// StageNames 已注册的 Stage 工厂名单。
 func StageNames() []string {
 	mu.RLock()
 	defer mu.RUnlock()
-	out := make([]string, 0, len(stages))
-	for n := range stages {
-		out = append(out, n)
-	}
-	sort.Strings(out)
-	return out
+	return sortedKeys(stages)
 }

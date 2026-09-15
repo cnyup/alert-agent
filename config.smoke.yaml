@@ -1,0 +1,43 @@
+# 冒烟测试配置（远程 /root/code/alert-agent 下使用）
+server:
+  addr: ":18080"
+
+llm:
+  router: {}
+  reasoner: {}
+
+sources:
+  - type: webhook
+    path: /hooks/alertmanager
+    parse: alertmanager
+
+pipeline:
+  - stage: dedup
+    window: 5m
+  - stage: silence
+    match: "env=staging"
+  - stage: route
+    rules:
+      - name: order-prod
+        match: { service: order-api, env: prod }
+        severity: critical
+        skills: [http-5xx-spike, k8s-crashloop]
+        notifiers: [feishu-card]
+      - name: db-warning
+        match: { component: postgres }
+        severity: warning
+        skills: [pg-conn-exhaust]
+
+skills:
+  dir: ./skills
+
+mcp:
+  servers: {}
+
+policy:
+  execution: suggest-only
+
+notifiers: []
+
+store:
+  path: data/smoke.db

@@ -2,49 +2,56 @@ package plugin
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/cnyup/alert-agent/pkg/model"
 )
 
-// 测试用假插件
-type fakeSource struct{ name string }
+// 假 Stage 工厂：记录实例化次数，验证"每配置条目一个实例"
+type stageBook struct{ name string }
 
-func (f *fakeSource) Name() string { return f.name }
-func (f *fakeSource) Start(_ context.Context, _ EmitFunc) error { return nil }
-
-type fakeStage struct{ name string }
-
-func (f *fakeStage) Name() string { return f.name }
-func (f *fakeStage) Process(_ context.Context, evt *model.AlertEvent) (*model.AlertEvent, Action, error) {
+func (s *stageBook) Name() string { return s.name }
+func (s *stageBook) Process(_ context.Context, evt *model.AlertEvent) (*model.AlertEvent, Action, error) {
 	return evt, ActionContinue, nil
 }
 
-func TestRegistryRegisterAndLookup(t *testing.T) {
-	// 用未注册的名字先清理，避免与其他测试并行注册互相污染
-	RegisterSource(&fakeSource{name: "src-test"})
-	RegisterStage(&fakeStage{name: "stage-test"})
+func TestFactoryRegistryInstantiate(t *testing.T) {
+	RegisterStageFactory("stage-test", func(opts map[string]any) (Stage, error) {
+		return &stageBook{name: "stage-test"}, nil
+	})
+	RegisterStageFactory("stage-err", func(opts map[string]any) (Stage, error) {
+		return nil, errors.New("bad options")
+	})
 
-	if _, ok := LookupSource("src-test"); !ok {
-		t.Fatal("注册后的 Source 应可查到")
+	s1, err := NewStage("stage-test", nil)
+	if err != nil {
+		t.Fatalf("实例化失败: %v", err)
 	}
-	if _, ok := LookupSource("nope"); ok {
-		t.Fatal("未注册的 Source 不应查到")
+	s2, _ := NewStage("stage-test", nil)
+	if s1 == s2 {
+		t.Fatal("两次装配应产生两个独立实例")
 	}
-	if _, ok := LookupStage("stage-test"); !ok {
-		t.Fatal("注册后的 Stage 应可查到")
+	if s1.Name() != "stage-test" {
+		t.Fatalf("名字不符: %s", s1.Name())
 	}
-	if len(SourceNames()) == 0 || len(StageNames()) == 0 {
-		t.Fatal("名单不应为空")
+	if _, err := NewStage("stage-err", nil); err == nil {
+		t.Fatal("工厂报错应透传")
+	}
+	if _, err := NewStage("nope", nil); err == nil {
+		t.Fatal("未注册的 stage 应报错")
+	}
+	if len(StageNames()) < 2 {
+		t.Fatal("工厂名单不全")
 	}
 }
 
-func TestRegistryDuplicatePanics(t *testing.T) {
+func TestFactoryDuplicatePanics(t *testing.T) {
 	defer func() {
 		if recover() == nil {
 			t.Fatal("重复注册应 panic")
 		}
 	}()
-	RegisterSource(&fakeSource{name: "src-dup"})
-	RegisterSource(&fakeSource{name: "src-dup"})
+	RegisterStageFactory("stage-dup", func(map[string]any) (Stage, error) { return nil, nil })
+	RegisterStageFactory("stage-dup", func(map[string]any) (Stage, error) { return nil, nil })
 }

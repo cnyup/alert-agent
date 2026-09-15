@@ -1,8 +1,9 @@
-// alert-agent 入口：配置装载 → 插件注册（各插件包 init）→ 生命周期管理。
+// alert-agent 入口：配置装载 → 插件注册（各插件包 init）→ 装配与生命周期管理。
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,10 +11,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/cnyup/alert-agent/internal/config"
+	"github.com/cnyup/alert-agent/internal/pipeline"
+	"github.com/cnyup/alert-agent/internal/store"
+	"github.com/cnyup/alert-agent/pkg/model"
+	"github.com/cnyup/alert-agent/pkg/plugin"
+
+	// 内置插件集：init() 注册工厂（编译期注册，DESIGN.md 三层扩展模型第二层）
+	_ "github.com/cnyup/alert-agent/internal/webhook"
 )
 
 var version = "dev"
@@ -37,25 +46,86 @@ func main() {
 		slog.Error("配置装载失败", "err", err)
 		os.Exit(1)
 	}
-	slog.Info("配置装载完成",
-		"addr", cfg.Server.Addr,
-		"policy", cfg.Policy.Execution,
-		"skills_dir", cfg.Skills.Dir,
-		"store", cfg.Store.Path,
-	)
 
-	// 里程碑3 起：此处按 cfg 装配 sources / pipeline / notifiers 并启动。
-	// P0 骨架：仅暴露健康检查端点，验证生命周期与构建链路。
+	// 存储
+	if dir := filepath.Dir(cfg.Store.Path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			slog.Error("创建数据目录失败", "dir", dir, "err", err)
+			os.Exit(1)
+		}
+	}
+	st, err := store.Open(cfg.Store.Path)
+	if err != nil {
+		slog.Error("存储打开失败", "err", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+
+	// 管道装配
+	specs := make([]pipeline.StageSpec, 0, len(cfg.Pipeline))
+	for _, sc := range cfg.Pipeline {
+		specs = append(specs, pipeline.StageSpec{Name: sc.Stage, Options: sc.Options})
+	}
+	runner, err := pipeline.New(specs)
+	if err != nil {
+		slog.Error("管道装配失败", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("管道装配完成", "stages", runner.Names())
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// 事件出口：落库 → 管道 → trace。P0 的管道终点是路由完成；
+	// 里程碑4 在此接入排查内核（按 res.Route.Skills 选剧本）。
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+
+	handleEvent := func(ctx context.Context, evt *model.AlertEvent) error {
+		if err := st.SaveEvent(ctx, evt); err != nil {
+			slog.Error("事件落库失败", "id", evt.ID, "err", err)
+		}
+		res := runner.Run(ctx, evt)
+		// 管道各阶段写入 trace（S<n> 编号）
+		for i, sl := range res.StageLog {
+			b, _ := json.Marshal(sl)
+			_ = st.AppendTrace(ctx, evt.ID, store.TraceEntry{
+				Seq: i, ID: fmt.Sprintf("S%d", i+1), Kind: "stage",
+				Name: sl.Stage, Output: string(b), At: sl.At,
+			})
+		}
+		if res.Dropped {
+			slog.Info("事件被管道终止", "id", evt.ID, "stage", res.DropBy, "title", evt.Title)
+			return nil
+		}
+		slog.Info("事件通过管道", "id", evt.ID, "severity", evt.Severity,
+			"title", evt.Title, "route", jsonOrNull(res.Route))
+		return nil
+	}
+
+	// 源装配与启动
+	for _, sc := range cfg.Sources {
+		src, err := plugin.NewSource(sc.Type, sc.Options)
+		if err != nil {
+			slog.Error("源装配失败", "type", sc.Type, "err", err)
+			os.Exit(1)
+		}
+		if m, ok := src.(interface{ SetMux(*http.ServeMux) }); ok {
+			m.SetMux(mux)
+		}
+		go func(name string) {
+			if err := src.Start(ctx, func(ctx context.Context, evt *model.AlertEvent) error {
+				return handleEvent(ctx, evt)
+			}); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Error("源退出", "type", name, "err", err)
+			}
+		}(sc.Type)
+	}
+
 	srv := &http.Server{Addr: cfg.Server.Addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	errCh := make(chan error, 1)
 	go func() {
 		slog.Info("HTTP 服务启动", "addr", cfg.Server.Addr)
@@ -78,4 +148,12 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("已退出")
+}
+
+func jsonOrNull(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "null"
+	}
+	return string(b)
 }
