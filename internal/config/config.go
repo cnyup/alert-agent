@@ -118,15 +118,11 @@ func (c *Config) validate() error {
 		if s.Type == "" {
 			return fmt.Errorf("sources[%d].type 不能为空", i)
 		}
-		if _, ok := pluginType(s.Type); !ok {
-			return fmt.Errorf("sources[%d].type %q 未注册", i, s.Type)
+	}
+	for i, s := range c.Pipeline {
+		if s.Stage == "" {
+			return fmt.Errorf("pipeline[%d].stage 不能为空", i)
 		}
 	}
 	return nil
-}
-
-// pluginType 占位：里程碑3 接入真实注册表后由 plugin.LookupSource 替代。
-func pluginType(name string) (struct{}, bool) {
-	// P0 骨架阶段：允许任意 type，装配校验在插件注册表落地后收紧
-	return struct{}{}, true
 }
