@@ -29,7 +29,7 @@ pipeline:
         skills: [pg-conn-exhaust]
 
 skills:
-  dir: ./skills
+  dir: ./skills/examples
 
 mcp:
   servers: {}
@@ -37,7 +37,8 @@ mcp:
 policy:
   execution: suggest-only
 
-notifiers: []
+notifiers:
+  - type: log
 
 store:
   path: data/smoke.db
