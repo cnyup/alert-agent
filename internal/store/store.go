@@ -65,7 +65,12 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: 初始化 schema 失败: %w", err)
 	}
-	return &Store{db: db}, nil
+	st := &Store{db: db}
+	if err := st.ensureP1(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: 初始化 P1 schema 失败: %w", err)
+	}
+	return st, nil
 }
 
 // Close 关闭连接。
@@ -149,4 +154,141 @@ func (s *Store) Trace(ctx context.Context, eventID string) ([]TraceEntry, error)
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// ---- P1：审批状态机与反馈闭环 ----
+
+// Approval 一条 mutating 动作的审批记录（异步跨重启状态机，DESIGN.md §5）。
+type Approval struct {
+	EventID     string     `json:"event_id"`
+	ActionID    string     `json:"action_id"`
+	Title       string     `json:"title"`
+	Risk        string     `json:"risk"`
+	Tool        string     `json:"tool"`
+	ArgsJSON    string     `json:"args,omitempty"`
+	Status      string     `json:"status"` // pending | approved | rejected | executed | failed
+	RequestedAt time.Time  `json:"requested_at"`
+	DecidedAt   *time.Time `json:"decided_at,omitempty"`
+	DecidedBy   string     `json:"decided_by,omitempty"` // 飞书 open_id
+	Result      string     `json:"result,omitempty"`     // 执行结果
+}
+
+// Feedback 人工反馈（认领/误报/根因确认），P2 剧本蒸馏的数据源。
+type Feedback struct {
+	EventID   string    `json:"event_id"`
+	Kind      string    `json:"kind"` // claim | false-positive | root-confirmed
+	Operator  string    `json:"operator,omitempty"`
+	Note      string    `json:"note,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+const schemaP1 = `
+CREATE TABLE IF NOT EXISTS approvals (
+  event_id     TEXT NOT NULL,
+  action_id    TEXT NOT NULL,
+  title        TEXT NOT NULL,
+  risk         TEXT NOT NULL,
+  tool         TEXT NOT NULL,
+  args         TEXT,
+  status       TEXT NOT NULL,
+  requested_at TIMESTAMP NOT NULL,
+  decided_at   TIMESTAMP,
+  decided_by   TEXT,
+  result       TEXT,
+  PRIMARY KEY (event_id, action_id)
+);
+CREATE TABLE IF NOT EXISTS card_refs (
+  message_id TEXT PRIMARY KEY,
+  event_id   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feedback (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id   TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  operator   TEXT,
+  note       TEXT,
+  created_at TIMESTAMP NOT NULL
+);
+`
+
+// SaveApproval 写入/覆盖审批记录。
+func (s *Store) SaveApproval(ctx context.Context, a Approval) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT OR REPLACE INTO approvals
+		(event_id, action_id, title, risk, tool, args, status, requested_at, decided_at, decided_by, result)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		a.EventID, a.ActionID, a.Title, a.Risk, a.Tool, a.ArgsJSON, a.Status,
+		a.RequestedAt.UTC(), nullableTime(a.DecidedAt), a.DecidedBy, a.Result)
+	if err != nil {
+		return fmt.Errorf("store: 审批落库失败: %w", err)
+	}
+	return nil
+}
+
+// GetApproval 取单条审批。
+func (s *Store) GetApproval(ctx context.Context, eventID, actionID string) (*Approval, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT event_id, action_id, title, risk, tool, args, status, requested_at, decided_at, decided_by, result
+		FROM approvals WHERE event_id = ? AND action_id = ?`, eventID, actionID)
+	var a Approval
+	var decidedAt, args, result sql.NullString
+	if err := row.Scan(&a.EventID, &a.ActionID, &a.Title, &a.Risk, &a.Tool, &args, &a.Status,
+		&a.RequestedAt, &decidedAt, &a.DecidedBy, &result); err != nil {
+		return nil, fmt.Errorf("store: 取回审批失败: %w", err)
+	}
+	a.ArgsJSON, a.Result = args.String, result.String
+	if decidedAt.Valid {
+		t, _ := time.Parse("2006-01-02 15:04:05.999999999-07:00", decidedAt.String)
+		t2, _ := time.Parse("2006-01-02T15:04:05Z", decidedAt.String)
+		if !t.IsZero() {
+			a.DecidedAt = &t
+		} else if !t2.IsZero() {
+			a.DecidedAt = &t2
+		}
+	}
+	return &a, nil
+}
+
+// SaveFeedback 反馈落库。
+func (s *Store) SaveFeedback(ctx context.Context, f Feedback) error {
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO feedback (event_id, kind, operator, note, created_at) VALUES (?,?,?,?,?)`,
+		f.EventID, f.Kind, f.Operator, f.Note, f.CreatedAt.UTC()); err != nil {
+		return fmt.Errorf("store: 反馈落库失败: %w", err)
+	}
+	return nil
+}
+
+// Open 追加 P1 schema（幂等）。
+func (s *Store) ensureP1() error {
+	_, err := s.db.Exec(schemaP1)
+	return err
+}
+
+func nullableTime(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return t.UTC()
+}
+
+// ---- P1：卡片消息映射（回复卡片 → 事件关联）----
+
+// SaveCardRef 记录报告卡片的 message_id → event_id。
+func (s *Store) SaveCardRef(ctx context.Context, eventID, messageID string) error {
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO card_refs (message_id, event_id) VALUES (?,?)`, messageID, eventID); err != nil {
+		return fmt.Errorf("store: 卡片映射落库失败: %w", err)
+	}
+	return nil
+}
+
+// EventIDByCard 按卡片 message_id 查事件。
+func (s *Store) EventIDByCard(messageID string) (string, bool) {
+	var eventID string
+	err := s.db.QueryRow(`SELECT event_id FROM card_refs WHERE message_id = ?`, messageID).Scan(&eventID)
+	if err != nil {
+		return "", false
+	}
+	return eventID, true
 }
