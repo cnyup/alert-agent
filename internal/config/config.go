@@ -55,7 +55,8 @@ type Config struct {
 		Dir string `yaml:"dir"`
 	} `yaml:"skills"`
 	MCP struct {
-		Servers map[string]MCPServerConfig `yaml:"servers"`
+		Dir     string                      `yaml:"dir"` // 目录式配置：一个 yaml 文件一个 server
+		Servers map[string]MCPServerConfig  `yaml:"servers"`
 	} `yaml:"mcp"`
 	Policy struct {
 		Execution string `yaml:"execution"` // suggest-only | approval-required | auto+whitelist

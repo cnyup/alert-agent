@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -66,4 +67,34 @@ func TestBuildToolsAndCall(t *testing.T) {
 		}
 	}
 	t.Log("MCP 链路验证通过:", ToolNames(tools))
+}
+
+func TestLoadDir(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "workflow-logs.yaml"),
+		[]byte("command: /bin/echo\nargs: [\"--mcp\"]\nenv:\n  K: v\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "ignored.txt"), []byte("非 yaml 忽略"), 0o644)
+	t.Setenv("MCP_TEST_TOKEN", "tok123")
+	os.WriteFile(filepath.Join(dir, "secure.yaml"),
+		[]byte("command: /bin/srv\nenv:\n  TOKEN: ${MCP_TEST_TOKEN}\n"), 0o644)
+
+	got, err := LoadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("应发现 2 个 server，实得 %d: %v", len(got), got)
+	}
+	if got["workflow-logs"].Command != "/bin/echo" || len(got["workflow-logs"].Args) != 1 {
+		t.Fatalf("workflow-logs 解析不符: %+v", got["workflow-logs"])
+	}
+	if got["secure"].Env["TOKEN"] != "tok123" {
+		t.Fatalf("env 展开失败: %+v", got["secure"])
+	}
+
+	// 目录不存在 = 合法空集
+	empty, err := LoadDir(filepath.Join(dir, "nope"))
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("不存在目录应返回空集: %v %v", err, empty)
+	}
 }

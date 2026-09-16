@@ -126,8 +126,17 @@ func main() {
 		os.Exit(1)
 	default:
 		var agentTools []tool.BaseTool
-		if len(cfg.MCP.Servers) > 0 {
-			agentTools, err = mcpagent.BuildTools(ctx0(), cfg.MCP.Servers)
+		// MCP 配置合并：目录式（mcp/<name>.yaml）打底，config.yaml 内联覆盖
+		mcpServers, err := mcpagent.LoadDir(cfg.MCP.Dir)
+		if err != nil {
+			slog.Error("MCP 目录配置装载失败", "dir", cfg.MCP.Dir, "err", err)
+			os.Exit(1)
+		}
+		for n, sc := range cfg.MCP.Servers {
+			mcpServers[n] = sc
+		}
+		if len(mcpServers) > 0 {
+			agentTools, err = mcpagent.BuildTools(ctx0(), mcpServers)
 			if err != nil {
 				slog.Error("MCP 工具装配失败", "err", err)
 				os.Exit(1)
