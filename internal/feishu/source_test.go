@@ -58,3 +58,35 @@ func TestExtractText(t *testing.T) {
 		t.Fatalf("非 JSON 容错失败: %q", got)
 	}
 }
+
+func TestExtractQuotedAlert(t *testing.T) {
+	// text
+	title, desc := extractQuotedAlert("text", `{"text":"[FIRING] CPU 使用率 92%"}`)
+	if title != "[FIRING] CPU 使用率 92%" || desc != title {
+		t.Fatalf("text 解析失败: %q", title)
+	}
+	// interactive 卡片：标题 + 原始 JSON 作描述
+	title2, desc2 := extractQuotedAlert("interactive", `{"title":{"content":"🔴 严重告警"},"elements":[{"text":{"content":"CPU 92%","tag":"lark_md"}}]}`)
+	if title2 != "🔴 严重告警" {
+		t.Fatalf("卡片标题提取失败: %q", title2)
+	}
+	if !contains(desc2, "CPU 92%") {
+		t.Fatalf("卡片 JSON 应完整进描述: %q", desc2)
+	}
+	// post 富文本
+	title3, _ := extractQuotedAlert("post", `{"content":[[{"tag":"text","text":"磁盘告警"},{"tag":"text","text":"：使用率95%"}]]}`)
+	if !contains(title3, "磁盘告警") || !contains(title3, "95%") {
+		t.Fatalf("post 解析失败: %q", title3)
+	}
+}
+
+func contains(s, sub string) bool { return len(s) >= len(sub) && (s == sub || len(sub) == 0 || indexOf(s, sub) >= 0) }
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}

@@ -5,6 +5,8 @@ package feishu
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -142,14 +144,16 @@ func (s *source) onMessage(ctx context.Context, ev *larkim.P2MessageReceiveV1, e
 	rootID := deref(msg.RootId)
 	text := extractText(deref(msg.Content))
 
-	// ① 回复报告卡片 → 闭环指令（root_id 命中卡片映射）
-	if rootID != "" && resolve != nil && isCommand(text) {
-		if eventID, ok := resolve(rootID); ok {
+	parentID := deref(msg.ParentId)
+
+	// ① 回复报告卡片 → 闭环指令（root/parent 命中卡片映射）
+	if cmdID := firstNonEmpty(rootID, parentID); cmdID != "" && isCommand(text) && resolve != nil {
+		if eventID, ok := resolve(cmdID); ok {
 			return s.handleCommand(ctx, eventID, text, chatID, decide)
 		}
 	}
 
-	// ② 普通消息 → 新告警：单聊直接响应；群聊要求 @机器人
+	// 群聊要求 @机器人、白名单过滤（单聊直接响应）
 	if chatType == "group" {
 		if len(s.whitelist) > 0 && !s.whitelist[chatID] {
 			slog.Debug("飞书群消息忽略（不在白名单）", "chat", chatID)
@@ -159,14 +163,21 @@ func (s *source) onMessage(ctx context.Context, ev *larkim.P2MessageReceiveV1, e
 			slog.Info("飞书群消息忽略（未 @机器人）", "chat", chatID, "text", truncateRunes(text, 40))
 			return nil
 		}
-	} else {
-		slog.Info("飞书单聊消息", "chat", chatID, "text", truncateRunes(text, 40))
 	}
+
+	// ② 引用消息排查（设计初衷场景）：被引用的消息内容作为告警
+	if quotedID := firstNonEmpty(parentID, rootID); quotedID != "" {
+		if resolve == nil || func() bool { _, ok := resolve(quotedID); return !ok }() {
+			return s.investigateQuoted(ctx, quotedID, chatID, msgID, emit)
+		}
+	}
+
+	// ③ 普通文本消息 → 新告警
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
 	evt, err := model.NewEvent("feishu/message", model.SeverityWarning, truncateRunes(text, 80),
-		model.Labels{"via": "feishu", "chat_id": chatID},
+		model.Labels{"via": "feishu", "chat_id": chatID, "alert_key": shortHash(text)},
 		time.Now().UTC(), []byte(deref(msg.Content)),
 		map[string]string{"feishu_chat_id": chatID, "feishu_message_id": msgID})
 	if err != nil {
@@ -174,6 +185,125 @@ func (s *source) onMessage(ctx context.Context, ev *larkim.P2MessageReceiveV1, e
 	}
 	evt.Description = text
 	return emit(ctx, evt)
+}
+
+// investigateQuoted 引用消息排查：拉取被引用消息，其内容作为告警。
+func (s *source) investigateQuoted(ctx context.Context, quotedID, chatID, msgID string, emit plugin.EmitFunc) error {
+	mtype, content, err := s.fetchMessage(ctx, quotedID)
+	if err != nil {
+		slog.Error("引用消息拉取失败（应用需开通 im:message 读取权限）",
+			"quoted", quotedID, "err", err)
+		return nil // 不中断，也不误把回复文本当告警
+	}
+	title, desc := extractQuotedAlert(mtype, content)
+	if strings.TrimSpace(title) == "" && strings.TrimSpace(desc) == "" {
+		slog.Warn("引用消息无可解析内容", "quoted", quotedID, "type", mtype)
+		return nil
+	}
+	slog.Info("引用消息排查", "quoted", quotedID, "type", mtype, "title", truncateRunes(title, 40))
+	evt, err := model.NewEvent("feishu/quote", model.SeverityWarning, truncateRunes(title, 80),
+		model.Labels{"via": "feishu", "chat_id": chatID, "alert_key": "fq_" + quotedID},
+		time.Now().UTC(), []byte(content),
+		map[string]string{"feishu_chat_id": chatID, "feishu_message_id": msgID, "quoted_message_id": quotedID})
+	if err != nil {
+		return err
+	}
+	evt.Description = desc
+	return emit(ctx, evt)
+}
+
+// fetchMessage 调用 im API 取一条消息（type, content）。
+func (s *source) fetchMessage(ctx context.Context, messageID string) (mtype, content string, err error) {
+	req := larkim.NewGetMessageReqBuilder().MessageId(messageID).Build()
+	resp, err := s.client.Im.Message.Get(ctx, req)
+	if err != nil {
+		return "", "", err
+	}
+	if !resp.Success() {
+		return "", "", fmt.Errorf("code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	items := resp.Data.Items
+	if len(items) == 0 || items[0].Body == nil {
+		return "", "", fmt.Errorf("消息体为空")
+	}
+	return deref(items[0].MsgType), deref(items[0].Body.Content), nil
+}
+
+// extractQuotedAlert 从被引用消息提取告警标题与描述：
+// text → 原文；post → 拼接富文本段；interactive（告警卡片）→ 卡片标题 + 原始 JSON
+//（卡片 JSON 直接进 description，排查 LLM 可读）。
+func extractQuotedAlert(mtype, content string) (title, desc string) {
+	switch mtype {
+	case "text":
+		var c struct {
+			Text string `json:"text"`
+		}
+		if json.Unmarshal([]byte(content), &c) == nil && c.Text != "" {
+			return c.Text, c.Text
+		}
+		return content, content
+	case "post":
+		var sb strings.Builder
+		var c map[string]any
+		if json.Unmarshal([]byte(content), &c) == nil {
+			collectPostText(c, &sb)
+		}
+		t := sb.String()
+		return t, t
+	case "interactive":
+		var c struct {
+			Title struct {
+				Content string `json:"content"`
+			} `json:"title"`
+			Elements []struct {
+				Text *struct {
+					Content string `json:"content"`
+					Tag     string `json:"tag"`
+				} `json:"text"`
+			} `json:"elements"`
+		}
+		t := "飞书引用卡片告警"
+		if json.Unmarshal([]byte(content), &c) == nil && c.Title.Content != "" {
+			t = c.Title.Content
+		}
+		return t, content // 卡片原始 JSON 作为描述，LLM 可解析
+	default:
+		return "引用消息告警（" + mtype + "）", content
+	}
+}
+
+func collectPostText(node any, sb *strings.Builder) {
+	switch v := node.(type) {
+	case string:
+		sb.WriteString(v)
+		sb.WriteString(" ")
+	case []any:
+		for _, x := range v {
+			collectPostText(x, sb)
+		}
+	case map[string]any:
+		if t, ok := v["text"].(string); ok {
+			sb.WriteString(t)
+			sb.WriteString(" ")
+		}
+		for _, x := range v {
+			collectPostText(x, sb)
+		}
+	}
+}
+
+func firstNonEmpty(ss ...string) string {
+	for _, x := range ss {
+		if x != "" {
+			return x
+		}
+	}
+	return ""
+}
+
+func shortHash(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 // ---- 闭环指令 ----
