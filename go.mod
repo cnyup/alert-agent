@@ -1,6 +1,6 @@
 module github.com/cnyup/alert-agent
 
-go 1.27
+go 1.27.0
 
 require (
 	github.com/cloudwego/eino v0.9.19
@@ -8,6 +8,7 @@ require (
 	github.com/cloudwego/eino-ext/components/tool/mcp v0.0.9
 	github.com/larksuite/oapi-sdk-go/v3 v3.12.0
 	github.com/mark3labs/mcp-go v0.43.0
+	github.com/xmapst/xdag v0.0.0-20260901044018-1a1b3f0d9f55
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.58.0
 )

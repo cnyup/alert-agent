@@ -316,7 +316,8 @@ Eino 相关 import 全部收在 `internal/agent/eino/` 隔离层内。
   silence/aggregate 完整 stage 化、反馈落库、审批执行状态机。
 - **P2（越用越准）**：aggregate incident 聚合（窗口合并+风暴阈值升级+上下文注入）、
   剧本蒸馏（`-distill`：反馈→LLM 修订建议，不自动生效）、通知并行扇出+重试。
-  **xdag 决策（2026-09-16 修订）**：原计划的两个 DAG 场景（incident 聚合、多渠道扇出）
-  已分别用线性 stage 与 errgroup+重试实现，xdag 当前零能力增量；推迟到真实多分支编排
-  需求（如 incident 级修复链：回滚→验证→通知）出现时再引入评估。
+  **xdag 决策（2026-09-16 二次修订）**：通知扇出已改造为 xdag 任务图
+  （internal/fanout：每通道一个任务，RetryPolicy 指数退避按次计费，取消单通路收敛；
+  实测通过重试/隔离/退避三用例，注意点：Execute 返回的 error 是任务级失败聚合，
+  基础设施判定以 States() 为准）。该包同时是未来 incident 级编排的接入模板。
   遗留：评估集回归测试、更多源/通知插件、多租户权限。

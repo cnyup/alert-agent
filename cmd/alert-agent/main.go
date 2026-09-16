@@ -13,7 +13,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -22,6 +21,7 @@ import (
 
 	"github.com/cnyup/alert-agent/internal/agent"
 	"github.com/cnyup/alert-agent/internal/config"
+	"github.com/cnyup/alert-agent/internal/fanout"
 	"github.com/cnyup/alert-agent/internal/feishu"
 	"github.com/cnyup/alert-agent/internal/llm"
 	mcpagent "github.com/cnyup/alert-agent/internal/mcp"
@@ -286,31 +286,19 @@ func main() {
 		}
 
 		// 通知扇出：路由指定的目标优先，未指定则全部已装配通知器。
-		// 并行发送 + 指数退避重试（通知失败重投，最多 3 次）
+		// xdag 任务图：并行执行 + 指数退避重试 + 取消收敛（P2 技术验证）
 		targets := notifiers
 		if res.Route != nil && len(res.Route.Notifiers) > 0 {
 			targets = filterNotifiers(notifiers, res.Route.Notifiers)
 		}
-		notifyCtx, notifyCancel := context.WithTimeout(ctx, 30*time.Second)
-		var wg sync.WaitGroup
-		for _, n := range targets {
-			wg.Add(1)
-			go func(n plugin.Notifier) {
-				defer wg.Done()
-				var err error
-				for attempt := 0; attempt < 3; attempt++ {
-					if attempt > 0 {
-						time.Sleep(time.Duration(attempt) * 2 * time.Second)
-					}
-					if err = n.Notify(notifyCtx, report); err == nil {
-						return
-					}
-				}
-				slog.Error("通知重试后仍失败", "notifier", n.Name(), "err", err)
-			}(n)
-		}
-		wg.Wait()
+		notifyCtx, notifyCancel := context.WithTimeout(ctx, 60*time.Second)
+		failed, err := fanout.Notify(notifyCtx, targets, report)
 		notifyCancel()
+		if err != nil {
+			slog.Error("通知扇出执行失败", "err", err)
+		} else if len(failed) > 0 {
+			slog.Error("通知重试后仍失败", "channels", failed)
+		}
 		return nil
 	}
 
