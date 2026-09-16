@@ -32,10 +32,8 @@ skills:
   dir: ./skills
 
 mcp:
-  servers:
-    prometheus:
-      command: ./mcp-servers/prometheus
-      args: []
+  dir: ./mcp                      # 目录式：mcp/<name>.yaml 一个文件一个 server
+  servers: {}                     # 内联配置（覆盖同名目录文件）
 
 policy:
   execution: suggest-only              # suggest-only | approval-required | auto+whitelist
