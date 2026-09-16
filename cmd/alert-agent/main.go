@@ -138,10 +138,12 @@ func main() {
 		if len(mcpServers) > 0 {
 			agentTools, err = mcpagent.BuildTools(ctx0(), mcpServers)
 			if err != nil {
-				slog.Error("MCP 工具装配失败", "err", err)
-				os.Exit(1)
+				// 单个 MCP 配错不应打挂服务：降级为无工具排查（管道/通知照常）
+				slog.Error("MCP 工具装配失败，内核降级为无工具排查", "err", err)
+				agentTools = nil
+			} else {
+				slog.Info("MCP 工具就绪", "tools", mcpagent.ToolNames(agentTools))
 			}
-			slog.Info("MCP 工具就绪", "tools", mcpagent.ToolNames(agentTools))
 		}
 		diagnoser = agent.New(reasoner, agentTools, 12)
 		slog.Info("排查内核就绪")
