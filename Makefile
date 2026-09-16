@@ -1,8 +1,18 @@
 BINARY := alert-agent
 
-.PHONY: build test lint run release clean
+.PHONY: build test lint run release check-go clean
 
-build:
+# xdag 依赖硬性要求 Go >= 1.27；版本不足时提前给出明确指引
+check-go:
+	@v=$$(go version 2>/dev/null | grep -oE 'go1\.[0-9]+' | head -1 | cut -d. -f2); \
+	if [ -z "$$v" ] || [ "$$v" -lt 27 ]; then \
+		echo "错误: 需要 Go >= 1.27（xdag 依赖硬性要求），当前: $$(go version 2>/dev/null || echo 未安装)"; \
+		echo "安装: https://mirrors.aliyun.com/golang/ (Linux) 或 brew install go (Mac)"; \
+		echo "或让当前 Go 自动拉取 toolchain: go env -w GOSUMDB=sum.golang.org GOPROXY=https://goproxy.cn,direct"; \
+		exit 1; \
+	fi
+
+build: check-go
 	go build -o bin/$(BINARY) ./cmd/alert-agent
 
 test:
@@ -19,7 +29,7 @@ RELEASE := alert-agent-$(shell date +%Y%m%d)-linux-amd64
 
 # 交付包：静态二进制 + 剧本 + 配置样例 + systemd 单元（目标机无需 Go）
 # arm64 机器把 GOARCH 改掉重跑
-release:
+release: check-go
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o $(DIST)/$(RELEASE)/bin/alert-agent ./cmd/alert-agent
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o $(DIST)/$(RELEASE)/bin/mcp-stub ./cmd/mcp-stub
 	cp -r skills/examples $(DIST)/$(RELEASE)/skills
