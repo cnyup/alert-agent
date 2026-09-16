@@ -5,7 +5,12 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 
 	mcpext "github.com/cloudwego/eino-ext/components/tool/mcp"
 	"github.com/cloudwego/eino/components/tool"
@@ -62,3 +67,48 @@ func ToolNames(tools []tool.BaseTool) string {
 	}
 	return sb.String()
 }
+
+// LoadDir 目录式 MCP 配置发现：mcp/<name>.yaml 一个文件一个 server，
+// 文件名即 server 名（与 skills/<name>/SKILL.md 同构的用户体验）。
+// env 引用（${VAR}）由进程环境展开，凭证不落盘。
+func LoadDir(dir string) (map[string]config.MCPServerConfig, error) {
+	out := map[string]config.MCPServerConfig{}
+	if dir == "" {
+		return out, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out, nil // 目录不存在 = 无目录式配置，合法
+		}
+		return nil, fmt.Errorf("mcp: 读取目录 %s 失败: %w", dir, err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(e.Name())
+		if ext != ".yaml" && ext != ".yml" {
+			continue
+		}
+		name := strings.TrimSuffix(e.Name(), ext)
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("mcp: 读取 %s 失败: %w", e.Name(), err)
+		}
+		expanded := envRef.ReplaceAllStringFunc(string(raw), func(m string) string {
+			return os.Getenv(envRef.FindStringSubmatch(m)[1])
+		})
+		var sc config.MCPServerConfig
+		if err := yaml.Unmarshal([]byte(expanded), &sc); err != nil {
+			return nil, fmt.Errorf("mcp: %s 解析失败: %w", e.Name(), err)
+		}
+		if sc.Command == "" {
+			return nil, fmt.Errorf("mcp: %s 缺少 command", e.Name())
+		}
+		out[name] = sc
+	}
+	return out, nil
+}
+
+var envRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
