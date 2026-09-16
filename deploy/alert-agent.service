@@ -1,0 +1,25 @@
+[Unit]
+Description=alert-agent 可插拔告警排查 Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 部署路径（二进制+配置+剧本+.env 同目录）
+WorkingDirectory=/opt/alert-agent
+ExecStart=/opt/alert-agent/bin/alert-agent -config /opt/alert-agent/config.yaml
+Environment=HOME=/opt/alert-agent
+Restart=always
+RestartSec=5
+# 崩溃自动拉起；优雅停止给足排查收尾时间
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# 最小权限加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/alert-agent/data
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
