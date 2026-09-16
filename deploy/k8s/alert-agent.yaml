@@ -213,9 +213,24 @@ spec:
               - { key: prometheus.yaml, path: prometheus.yaml }
               - { key: workflow-logs.yaml, path: workflow-logs.yaml }
         - name: data
-          emptyDir: {}                        # 要持久化历史（trace/审批/反馈）换 PVC
+          emptyDir: {}                        # 要持久化历史（trace/审批/反馈）换 PVC（见下方模板）
 
 ---
+# 可选：SQLite 数据持久化。启用方法：
+#   1) 取消本段注释；2) 上方 volumes.data 改为：
+#        persistentVolumeClaim: { claimName: alert-agent-data }
+# 注意 ReadWriteOnce 单节点绑定——与单副本约束天然一致。
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: alert-agent-data
+# spec:
+#   accessModes: [ReadWriteOnce]
+#   resources:
+#     requests:
+#       storage: 5Gi
+---
+
 apiVersion: v1
 kind: Service
 metadata:
