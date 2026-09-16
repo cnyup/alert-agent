@@ -88,7 +88,7 @@ func TestDiagnoseHappyPath(t *testing.T) {
 		"订单服务 5xx 飙升", coremodel.Labels{"service": "order-api"}, time.Now(), nil, nil)
 
 	r := New(fm, []tool.BaseTool{&fakeTool{name: "prometheus_query"}, &fakeTool{name: "k8s_get_pod"}}, 10)
-	report, evidence, err := r.Diagnose(context.Background(), evt, skill)
+	report, evidence, err := r.Diagnose(context.Background(), evt, skill, "")
 	if err != nil {
 		t.Fatalf("排查失败: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestDiagnoseBadJSONFallsBackToHuman(t *testing.T) {
 	evt, _ := coremodel.NewEvent("t", coremodel.SeverityWarning, "x",
 		coremodel.Labels{"a": "b"}, time.Now(), nil, nil)
 	r := New(fm, nil, 5)
-	report, _, err := r.Diagnose(context.Background(), evt, skill)
+	report, _, err := r.Diagnose(context.Background(), evt, skill, "")
 	if err != nil {
 		t.Fatalf("兜底路径不应报错: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestDiagnoseBudgetCap(t *testing.T) {
 	skill := loadSkill(t)
 	evt, _ := coremodel.NewEvent("t", coremodel.SeverityCritical, "x", nil, time.Now(), nil, nil)
 	r := New(fm, []tool.BaseTool{&fakeTool{name: "prometheus_query"}}, 3)
-	_, _, err := r.Diagnose(context.Background(), evt, skill)
+	_, _, err := r.Diagnose(context.Background(), evt, skill, "")
 	if err == nil {
 		t.Fatal("预算触顶应报错")
 	}

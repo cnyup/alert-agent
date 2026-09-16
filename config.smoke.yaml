@@ -18,8 +18,9 @@ sources:
     app_secret: ${FEISHU_APP_SECRET}
 
 pipeline:
-  - stage: dedup
+  - stage: aggregate
     window: 5m
+    escalate_at: 3
   - stage: silence
     match: "env=staging"
   - stage: route

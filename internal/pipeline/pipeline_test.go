@@ -161,3 +161,51 @@ func (dropStage) Name() string { return "test-drop" }
 func (dropStage) Process(_ context.Context, evt *model.AlertEvent) (*model.AlertEvent, plugin.Action, error) {
 	return evt, plugin.ActionDrop, nil
 }
+
+func TestAggregateIncident(t *testing.T) {
+	r, err := New([]StageSpec{{Name: "aggregate", Options: map[string]any{"window": "200ms", "escalate_at": 3}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := model.Labels{"service": "agg-svc"}
+
+	// 首条：通过，incident 建立
+	res := r.Run(context.Background(), mkEvent(t, fp))
+	if res.Dropped || res.Aggregate == nil || res.Aggregate.Occurrences != 1 {
+		t.Fatalf("首条应通过且计数 1: %+v", res.Aggregate)
+	}
+	incID := res.Aggregate.IncidentID
+
+	// 第 2 条：合并丢弃，同 incident
+	res2 := r.Run(context.Background(), mkEvent(t, fp))
+	if !res2.Dropped || res2.DropBy != "aggregate" || res2.Aggregate.IncidentID != incID || res2.Aggregate.Occurrences != 2 {
+		t.Fatalf("第 2 条应合并: dropped=%v agg=%+v", res2.Dropped, res2.Aggregate)
+	}
+
+	// 第 3 条：达到阈值升级放行，severity 提升 critical
+	res3 := r.Run(context.Background(), mkEvent(t, fp))
+	if res3.Dropped || !res3.Aggregate.Escalated {
+		t.Fatalf("阈值应升级放行: %+v", res3.Aggregate)
+	}
+	if res3.Event.Severity != model.SeverityCritical {
+		t.Fatalf("升级后等级应为 critical: %s", res3.Event.Severity)
+	}
+
+	// 第 4 条：继续合并（不再重复升级）
+	if res4 := r.Run(context.Background(), mkEvent(t, fp)); !res4.Dropped {
+		t.Fatal("超过阈值后应继续合并")
+	}
+
+	// 不同指纹互不影响
+	resOther := r.Run(context.Background(), mkEvent(t, model.Labels{"service": "other"}))
+	if resOther.Dropped || resOther.Aggregate.Occurrences != 1 {
+		t.Fatal("不同指纹应独立成 incident")
+	}
+
+	// 窗口过期重置
+	time.Sleep(220 * time.Millisecond)
+	resNew := r.Run(context.Background(), mkEvent(t, fp))
+	if resNew.Dropped || resNew.Aggregate.Occurrences != 1 || resNew.Aggregate.IncidentID == incID {
+		t.Fatal("窗口过期应开新 incident")
+	}
+}

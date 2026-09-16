@@ -13,10 +13,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/schema"
 
 	"github.com/cnyup/alert-agent/internal/agent"
 	"github.com/cnyup/alert-agent/internal/config"
@@ -42,6 +44,7 @@ func main() {
 		configPath = flag.String("config", "config.yaml", "配置文件路径")
 		showVer    = flag.Bool("version", false, "打印版本")
 		replayID   = flag.String("replay", "", "回放指定事件的 trace 后退出")
+		distill    = flag.Bool("distill", false, "把人工反馈蒸馏为剧本修订建议后退出")
 	)
 	flag.Parse()
 	if *showVer {
@@ -76,6 +79,15 @@ func main() {
 	// replay 模式：读库打印事件与全链路 trace，退出
 	if *replayID != "" {
 		replay(st, *replayID)
+		return
+	}
+
+	// distill 模式：反馈 → LLM → 剧本修订建议（不自动生效，用户确认后应用）
+	if *distill {
+		if err := runDistill(st, cfg); err != nil {
+			slog.Error("蒸馏失败", "err", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -233,9 +245,20 @@ func main() {
 			slog.Warn("无可用剧本（含通用兜底），跳过排查", "id", evt.ID)
 			return nil
 		}
-		slog.Info("开始排查", "id", evt.ID, "skill", skill.Name, "matched", skill.Name != "generic")
+		extra := ""
+		if res.Aggregate != nil {
+			extra = fmt.Sprintf("incident %s：本窗口第 %d 条同指纹告警", res.Aggregate.IncidentID, res.Aggregate.Occurrences)
+			if res.Aggregate.Escalated {
+				extra += "（已达到风暴升级阈值，等级提为 critical）"
+			}
+			slog.Info("开始排查", "id", evt.ID, "skill", skill.Name,
+				"incident", res.Aggregate.IncidentID, "occurrences", res.Aggregate.Occurrences,
+				"escalated", res.Aggregate.Escalated)
+		} else {
+			slog.Info("开始排查", "id", evt.ID, "skill", skill.Name, "matched", skill.Name != "generic")
+		}
 
-		report, evidence, err := diagnoser.Diagnose(ctx, evt, skill)
+		report, evidence, err := diagnoser.Diagnose(ctx, evt, skill, extra)
 		// 证据链落 trace（T<n> 编号，报告据此引用）
 		for i, e := range evidence {
 			_ = st.AppendTrace(ctx, evt.ID, store.TraceEntry{
@@ -262,16 +285,32 @@ func main() {
 			slog.Error("审批创建失败", "id", evt.ID, "err", err)
 		}
 
-		// 通知：路由指定的目标优先，未指定则全部已装配通知器
+		// 通知扇出：路由指定的目标优先，未指定则全部已装配通知器。
+		// 并行发送 + 指数退避重试（通知失败重投，最多 3 次）
 		targets := notifiers
 		if res.Route != nil && len(res.Route.Notifiers) > 0 {
 			targets = filterNotifiers(notifiers, res.Route.Notifiers)
 		}
+		notifyCtx, notifyCancel := context.WithTimeout(ctx, 30*time.Second)
+		var wg sync.WaitGroup
 		for _, n := range targets {
-			if err := n.Notify(ctx, report); err != nil {
-				slog.Error("通知失败", "notifier", n.Name(), "err", err)
-			}
+			wg.Add(1)
+			go func(n plugin.Notifier) {
+				defer wg.Done()
+				var err error
+				for attempt := 0; attempt < 3; attempt++ {
+					if attempt > 0 {
+						time.Sleep(time.Duration(attempt) * 2 * time.Second)
+					}
+					if err = n.Notify(notifyCtx, report); err == nil {
+						return
+					}
+				}
+				slog.Error("通知重试后仍失败", "notifier", n.Name(), "err", err)
+			}(n)
 		}
+		wg.Wait()
+		notifyCancel()
 		return nil
 	}
 
@@ -361,6 +400,87 @@ func filterNotifiers(all []plugin.Notifier, want []string) []plugin.Notifier {
 		}
 	}
 	return out
+}
+
+// runDistill 剧本蒸馏：汇总人工反馈 + 对应排查报告 → LLM 生成修订建议。
+func runDistill(st *store.Store, cfg *config.Config) error {
+	ctx := context.Background()
+	fbs, err := st.ListFeedback(ctx)
+	if err != nil {
+		return err
+	}
+	if len(fbs) == 0 {
+		fmt.Println("暂无人工反馈（先在飞书回复卡片：认领 / 误报 / 根因确认），无蒸馏输入。")
+		return nil
+	}
+	type record struct {
+		Feedback  store.Feedback `json:"feedback"`
+		Title     string         `json:"title"`
+		Labels    map[string]string `json:"labels"`
+		SkillID   string         `json:"skill_id,omitempty"`
+		Summary   string         `json:"report_summary,omitempty"`
+		RootCause string         `json:"root_cause,omitempty"`
+	}
+	var records []record
+	for _, fb := range fbs {
+		rec := record{Feedback: fb}
+		if evt, err := st.GetEvent(ctx, fb.EventID); err == nil {
+			rec.Title, rec.Labels = evt.Title, evt.Labels
+			if trace, err := st.Trace(ctx, fb.EventID); err == nil {
+				for _, e := range trace {
+					if e.ID != "R1" {
+						continue
+					}
+					var rep struct {
+						SkillID    string `json:"skill_id"`
+						Summary    string `json:"summary"`
+						RootCauses []struct {
+							Hypothesis string `json:"hypothesis"`
+						} `json:"root_causes"`
+					}
+					if json.Unmarshal([]byte(e.Output), &rep) == nil {
+						rec.SkillID, rec.Summary = rep.SkillID, rep.Summary
+						if len(rep.RootCauses) > 0 {
+							rec.RootCause = rep.RootCauses[0].Hypothesis
+						}
+					}
+				}
+			}
+		}
+		records = append(records, rec)
+	}
+	data, _ := json.MarshalIndent(records, "", "  ")
+
+	prompt := "你是告警排查系统的剧本（SKILL.md）维护助手。以下是运维人员对排查报告的人工反馈与对应告警/报告数据。\n\n" +
+		"请分析这些反馈，输出 Markdown 格式的剧本修订建议，规则：\n" +
+		"1. 误报反馈（false-positive）→ 分析共性（labels/标题模式），建议对应剧本的 triggers 如何收紧或排除；\n" +
+		"2. 根因确认（root-confirmed）→ 建议把验证过的判断标准沉淀进剧本的『判断标准』小节；\n" +
+		"3. 认领（claim）→ 仅统计，不必给建议；\n" +
+		"4. 每条建议必须注明依据的反馈条目；只基于数据，不臆造；无足够依据的模式宁可不建议。\n\n" +
+		"反馈数据：\n```json\n" + string(data) + "\n```"
+
+	reasoner, err := llm.New(ctx, cfg.LLM.Reasoner)
+	if err != nil {
+		return fmt.Errorf("蒸馏需要 reasoner（%w）", err)
+	}
+	resp, err := reasoner.Generate(ctx, []*schema.Message{
+		{Role: schema.User, Content: prompt},
+	})
+	if err != nil {
+		return fmt.Errorf("LLM 生成失败: %w", err)
+	}
+
+	out := "# 剧本修订建议（蒸馏于 " + time.Now().Format("2006-01-02 15:04") + "）\n\n" +
+		"> 由人工反馈自动生成，**未经确认不会生效**：请审阅后手工合并进对应 SKILL.md。\n\n" +
+		resp.Content + "\n"
+	os.MkdirAll("data", 0o755)
+	path := "data/distill-" + time.Now().Format("20060102-150405") + ".md"
+	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
+		return err
+	}
+	fmt.Println(out)
+	fmt.Printf("建议已写入 %s（共 %d 条反馈输入）\n", path, len(fbs))
+	return nil
 }
 
 // replay 回放一个事件的全链路 trace。
