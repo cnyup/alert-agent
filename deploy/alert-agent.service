@@ -9,6 +9,8 @@ Type=simple
 WorkingDirectory=/opt/alert-agent
 ExecStart=/opt/alert-agent/bin/alert-agent -config /opt/alert-agent/config.yaml
 Environment=HOME=/opt/alert-agent
+# 凭证显式注入（与二进制的 .env 装载双保险；文件不存在不影响启动）
+EnvironmentFile=/opt/alert-agent/.env
 Restart=always
 RestartSec=5
 # 崩溃自动拉起；优雅停止给足排查收尾时间
