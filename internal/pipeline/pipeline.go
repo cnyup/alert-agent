@@ -31,17 +31,19 @@ type StageLog struct {
 
 // Result 管道终态。
 type Result struct {
-	Event    *model.AlertEvent
-	Dropped  bool
-	DropBy   string // 作出 Drop 决定的 stage 名
-	Route    *RouteResult
-	StageLog []StageLog
+	Event     *model.AlertEvent
+	Dropped   bool
+	DropBy    string // 作出 Drop 决定的 stage 名
+	Route     *RouteResult
+	Aggregate *AggregateInfo
+	StageLog  []StageLog
 }
 
 // runState 单次管道运行的状态，经 ctx 传递（route stage 写入路由结果；
 // stage 实例是各装配点独立的，但仍不允许请求级状态落在实例上）。
 type runState struct {
-	route *RouteResult
+	route     *RouteResult
+	aggregate *AggregateInfo
 }
 
 type stateKey struct{}
@@ -124,10 +126,12 @@ func (r *Runner) Run(ctx context.Context, evt *model.AlertEvent) *Result {
 			res.Dropped = true
 			res.DropBy = e.name
 			res.Route = state.route
+			res.Aggregate = state.aggregate
 			return res
 		}
 	}
 	res.Route = state.route
+	res.Aggregate = state.aggregate
 	return res
 }
 

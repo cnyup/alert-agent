@@ -54,7 +54,8 @@ func (r *Runner) Tools() []tool.BaseTool { return r.tools }
 
 // Diagnose 对单条告警执行排查：注入剧本全文（第二阶段加载）→ 引擎执行 →
 // 解析并校验报告。skill 为 nil 时由调用方先落位通用兜底剧本。
-func (r *Runner) Diagnose(ctx context.Context, evt *coremodel.AlertEvent, skill *skills.Skill) (*coremodel.DiagnosisReport, []einoengine.Evidence, error) {
+// extraContext 为管道侧附加上下文（如 incident 聚合信息），空串表示无。
+func (r *Runner) Diagnose(ctx context.Context, evt *coremodel.AlertEvent, skill *skills.Skill, extraContext string) (*coremodel.DiagnosisReport, []einoengine.Evidence, error) {
 	start := time.Now()
 
 	// 剧本收权：只把剧本声明的工具交给引擎（skill.Tools 为空则不给工具——
@@ -72,10 +73,14 @@ func (r *Runner) Diagnose(ctx context.Context, evt *coremodel.AlertEvent, skill 
 	}
 
 	evtJSON, _ := json.MarshalIndent(evt, "", "  ")
+	userMsg := "排查以下告警：\n" + string(evtJSON)
+	if extraContext != "" {
+		userMsg += "\n\n## 管道上下文\n" + extraContext
+	}
 	out := einoengine.Run(ctx, einoengine.EngineInput{
 		Model:   r.reasoner,
 		System:  skill.Body + reportFormat,
-		User:    "排查以下告警：\n" + string(evtJSON),
+		User:    userMsg,
 		Tools:   allowed,
 		MaxIter: r.maxIter,
 	})

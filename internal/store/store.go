@@ -292,3 +292,24 @@ func (s *Store) EventIDByCard(messageID string) (string, bool) {
 	}
 	return eventID, true
 }
+
+// ListFeedback 列出全部反馈（蒸馏数据源）。
+func (s *Store) ListFeedback(ctx context.Context) ([]Feedback, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT event_id, kind, operator, note, created_at FROM feedback ORDER BY created_at`)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询反馈失败: %w", err)
+	}
+	defer rows.Close()
+	var out []Feedback
+	for rows.Next() {
+		var f Feedback
+		var op, note sql.NullString
+		if err := rows.Scan(&f.EventID, &f.Kind, &op, &note, &f.CreatedAt); err != nil {
+			return nil, err
+		}
+		f.Operator, f.Note = op.String, note.String
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
