@@ -72,7 +72,8 @@ func (a *aggregate) Process(ctx context.Context, evt *model.AlertEvent) (*model.
 	inc, ok := a.incidents[fp]
 	if !ok {
 		inc = &incidentState{
-			id:    fmt.Sprintf("inc_%s_%d", fp[:12], now.Unix()),
+			// 毫秒粒度：同指纹在窗口边界重开 incident 时，秒级时间戳会撞 ID
+			id:    fmt.Sprintf("inc_%s_%d", fp[:12], now.UnixMilli()),
 			start: now,
 			count: 0,
 		}
