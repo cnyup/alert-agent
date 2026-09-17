@@ -253,6 +253,28 @@ notifiers:
   剧本修订建议，用户自然语言确认后生效——系统越用越准，且用户改的是
   剧本不是代码。
 
+### 引用卡片提取器插件化（后续优化项，暂缓）
+
+引用消息排查目前内置一个**宽松格式**提取器：容忍 title 为字符串/对象、
+elements 任意嵌套，展平为可读文本——不绑定任何平台，但也不理解卡片结构
+（字段全部进 description 正文，labels 只有 via/chat_id）。
+
+若后续出现需要**结构化归一化**的场景（把卡片里的 对象类型/级别/业务线 等
+字段映射为 AlertEvent.labels，让 labels 规则路由与聚合指纹生效），则把提取
+器抽为 feishu 包内的注册制扩展点（对齐 §2.2 三层扩展模型：内置集编译期注册）：
+
+```go
+// internal/feishu：QuotedCardExtractor 按消息类型注册，source 装配时选用
+type QuotedCardExtractor interface {
+    Match(msgType, content string) bool
+    Extract(msgType, content string) (title, desc string, labels model.Labels)
+}
+```
+
+触发条件（满足其一才做，避免过度设计）：出现第 2 种非标准卡片格式无法
+宽松兼容；或业务要求卡片字段进 labels 参与路由/聚合。在此之前，宽松提取器
+够用且零维护。
+
 ## 6. 目录结构规划
 
 ```
