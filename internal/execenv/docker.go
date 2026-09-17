@@ -3,18 +3,23 @@ package execenv
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/cloudwego/eino-ext/components/tool/commandline"
 	"github.com/cloudwego/eino-ext/components/tool/commandline/sandbox"
+
+	coremodel "github.com/cnyup/alert-agent/pkg/model"
 )
 
 // dockerEnv 一个事件独占一个容器：Acquire 时 Create，Close 时 Cleanup。
 // 并发排查各自持有独立 DockerEnv，规避了沙箱组件本身无锁的问题。
 type dockerEnv struct {
-	sb      *sandbox.DockerSandbox
-	match   map[string]bool
-	maxOut  int
-	closed  bool
+	sb       *sandbox.DockerSandbox
+	match    map[string]bool
+	readonly map[string][]string
+	readOnly bool // 排查阶段 = true，拒绝 mutating 命令
+	maxOut   int
+	closed   bool
 }
 
 const stdinFile = "/tmp/execenv-stdin"
@@ -60,6 +65,10 @@ func (e *dockerEnv) Run(ctx context.Context, argv []string, stdin string) (Resul
 	if !e.match[argv[0]] {
 		return Result{Stderr: "[execenv] 二进制 " + argv[0] + " 不在白名单内", ExitCode: -2}, nil
 	}
+	if e.readOnly && classify(e.readonly, argv) == coremodel.RiskMutating {
+		return Result{Stderr: "[execenv] 命令 " + strings.Join(argv, " ") +
+			" 属于变更类（或未声明只读），排查阶段禁止执行；请作为 mutating 动作写入报告 actions，经审批后执行", ExitCode: -2}, nil
+	}
 	if stdin == "" {
 		return e.runArgv(ctx, argv)
 	}
@@ -73,8 +82,19 @@ func (e *dockerEnv) Close(ctx context.Context) {
 	}
 }
 
-// Acquire 起一个新容器（镜像/网络/资源/超时全来自配置，未配置走默认值）。
+// Acquire 排查阶段：起一个新容器并挂只读门禁（拒绝变更类命令）。
 func (f *dockerFactory) Acquire(ctx context.Context) (Env, error) {
+	return f.acquire(ctx, true)
+}
+
+// AcquireFull 审批后执行：同样一执行一容器，但不设只读门禁。
+func (f *dockerFactory) AcquireFull(ctx context.Context) (Env, error) {
+	return f.acquire(ctx, false)
+}
+
+func (f *dockerFactory) RiskOf(argv []string) coremodel.ToolRisk { return classify(f.readonly, argv) }
+
+func (f *dockerFactory) acquire(ctx context.Context, readOnly bool) (Env, error) {
 	sb, err := sandbox.NewDockerSandbox(ctx, &sandbox.Config{
 		Image:         f.cfg.Image,
 		NetworkEnabled: f.cfg.Network,
@@ -89,7 +109,7 @@ func (f *dockerFactory) Acquire(ctx context.Context) (Env, error) {
 	if err := sb.Create(ctx); err != nil {
 		return nil, fmt.Errorf("execenv: 沙箱容器启动失败: %w", err)
 	}
-	return &dockerEnv{sb: sb, match: f.matchSet, maxOut: f.cfg.MaxOutput}, nil
+	return &dockerEnv{sb: sb, match: f.matchSet, readonly: f.readonly, readOnly: readOnly, maxOut: f.cfg.MaxOutput}, nil
 }
 
 func truncateBytes(s string, n int) string {

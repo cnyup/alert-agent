@@ -44,11 +44,12 @@ type MCPServerConfig struct {
 // ToolsConfig 内置框架工具（exec/read），与 MCP 工具并列装配。
 type ToolsConfig struct {
 	Exec struct {
-		Enabled        bool     `yaml:"enabled"`
-		Backend        string   `yaml:"backend"` // local | docker
-		Allow          []string `yaml:"allow"`   // 二进制白名单（名字或绝对路径）
-		Timeout        string   `yaml:"timeout"` // 单命令超时，如 30s
-		MaxOutputBytes int      `yaml:"max_output_bytes"`
+		Enabled        bool              `yaml:"enabled"`
+		Backend        string            `yaml:"backend"` // local | docker
+		Allow          []string          `yaml:"allow"`   // 二进制白名单（名字或绝对路径）
+		Readonly       map[string][]string `yaml:"readonly"` // bin → 词对齐只读子命令前缀；未命中的调用一律按 mutating（宁严勿松）
+		Timeout        string            `yaml:"timeout"` // 单命令超时，如 30s
+		MaxOutputBytes int               `yaml:"max_output_bytes"`
 		Docker         struct {
 			Image    string   `yaml:"image"`   // 空 = 组件默认镜像
 			Network  *bool    `yaml:"network"` // 默认 true（CLI 需要访问 API）

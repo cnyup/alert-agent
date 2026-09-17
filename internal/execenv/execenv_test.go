@@ -25,7 +25,7 @@ func TestLocalWhitelist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env, _ := f.Acquire(context.Background())
+	env, _ := f.AcquireFull(context.Background())
 	res, err := env.Run(context.Background(), []string{"echo", "hello"}, "")
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +52,7 @@ func TestLocalStdin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env, _ := f.Acquire(context.Background())
+	env, _ := f.AcquireFull(context.Background())
 	res, err := env.Run(context.Background(), []string{"cat"}, `{"q":"omni"}`)
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +67,7 @@ func TestLocalTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env, _ := f.Acquire(context.Background())
+	env, _ := f.AcquireFull(context.Background())
 	res, err := env.Run(context.Background(), []string{"sleep", "5"}, "")
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +84,7 @@ func TestLocalOutputTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env, _ := f.Acquire(context.Background())
+	env, _ := f.AcquireFull(context.Background())
 	res, err := env.Run(context.Background(), []string{"echo", "aaaaaaaaaaaaaaaaaaaaaaaa"}, "")
 	if err != nil {
 		t.Fatal(err)
