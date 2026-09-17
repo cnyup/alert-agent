@@ -231,12 +231,12 @@ func (s *Store) GetApproval(ctx context.Context, eventID, actionID string) (*App
 		SELECT event_id, action_id, title, risk, tool, args, status, requested_at, decided_at, decided_by, result
 		FROM approvals WHERE event_id = ? AND action_id = ?`, eventID, actionID)
 	var a Approval
-	var decidedAt, args, result sql.NullString
+	var decidedAt, args, result, decidedBy sql.NullString
 	if err := row.Scan(&a.EventID, &a.ActionID, &a.Title, &a.Risk, &a.Tool, &args, &a.Status,
-		&a.RequestedAt, &decidedAt, &a.DecidedBy, &result); err != nil {
+		&a.RequestedAt, &decidedAt, &decidedBy, &result); err != nil {
 		return nil, fmt.Errorf("store: 取回审批失败: %w", err)
 	}
-	a.ArgsJSON, a.Result = args.String, result.String
+	a.ArgsJSON, a.Result, a.DecidedBy = args.String, result.String, decidedBy.String
 	if decidedAt.Valid {
 		t, _ := time.Parse("2006-01-02 15:04:05.999999999-07:00", decidedAt.String)
 		t2, _ := time.Parse("2006-01-02T15:04:05Z", decidedAt.String)
