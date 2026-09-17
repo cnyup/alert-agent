@@ -47,7 +47,9 @@ const reportFormat = `
   "needs_human": false
 }
 
-硬约束：root_causes 每条必须引用证据链编号（T1、T2…）；无证据的猜测不得写入。`
+硬约束：每个工具调用的返回内容开头都标注了它的证据编号（形如 "[T5] {...}"）；
+root_causes.evidence 只能引用**产出该证据数据**的工具调用编号（如查询执行步），
+不得引用装载文档的 read 步骤；无证据的猜测不得写入。`
 
 // Tools 返回排查内核持有的工具集（审批执行器按名查找用）。
 func (r *Runner) Tools() []tool.BaseTool { return r.tools }

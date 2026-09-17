@@ -35,6 +35,26 @@ mcp:
   dir: ./mcp                      # 目录式：mcp/<name>.yaml 一个文件一个 server
   servers: {}                     # 内联配置（覆盖同名目录文件）
 
+agent:
+  max_iterations: 30             # 排查内核模型轮次上限（技能文档加载+CLI 下钻都计入）
+
+tools:                            # 内置框架工具（技能文档即调用规范）
+  exec:                           # 白名单 CLI 执行（如 tt-devops-cli）
+    enabled: true
+    backend: local                # local（宿主机直跑）| docker（eino-ext 沙箱，一事件一容器）
+    allow: ["tt-devops-cli"]      # 白名单必填；名字走 PATH，也可写绝对路径
+    timeout: 30s                  # 单命令超时（默认）
+    max_output_bytes: 65536       # stdout/stderr 截断上限（默认 64KB）
+    docker:                       # backend=docker 时生效，均可用默认值
+      image: ""                   # 空 = 组件默认镜像；自定义镜像内需含白名单 CLI
+      network: true               # CLI 需访问 API，默认开（与沙箱组件默认相反）
+      memory_mb: 512
+      cpu: 1.0
+      timeout: 30s
+      env: []                     # 注入容器的环境变量，如 ["TT_API_TOKEN=${TT_API_TOKEN}"]
+  read:
+    enabled: true                 # 限定剧本目录内读文件（references 按需加载）
+
 policy:
   execution: suggest-only              # suggest-only | approval-required | auto+whitelist
 

@@ -9,8 +9,6 @@ import (
 	"sync"
 
 	"github.com/cloudwego/eino/adk"
-	"github.com/cloudwego/eino/callbacks"
-	"github.com/cloudwego/eino/components"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
@@ -48,38 +46,56 @@ type evidenceState struct {
 	entries []Evidence
 }
 
-func evidenceHandler(st *evidenceState) callbacks.Handler {
-	return callbacks.NewHandlerBuilder().
-		OnStartFn(func(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
-			if info == nil || info.Component != components.ComponentOfTool {
-				return ctx
-			}
-			in := tool.ConvCallbackInput(input)
-			if in == nil {
-				return ctx
-			}
-			st.mu.Lock()
-			st.entries = append(st.entries, Evidence{
-				ID:   fmt.Sprintf("T%d", len(st.entries)+1),
-				Tool: info.Name,
-				Args: in.ArgumentsInJSON,
-			})
-			st.mu.Unlock()
-			return ctx
-		}).
-		OnEndFn(func(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
-			if info == nil || info.Component != components.ComponentOfTool {
-				return ctx
-			}
-			out := tool.ConvCallbackOutput(output)
-			st.mu.Lock()
-			if out != nil && len(st.entries) > 0 && st.entries[len(st.entries)-1].Result == "" {
-				st.entries[len(st.entries)-1].Result = out.Response
-			}
-			st.mu.Unlock()
-			return ctx
-		}).
-		Build()
+// next 原子分配下一个证据编号并登记条目，返回条目下标。
+func (st *evidenceState) next(name, args string) (string, int) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	id := fmt.Sprintf("T%d", len(st.entries)+1)
+	st.entries = append(st.entries, Evidence{ID: id, Tool: name, Args: args})
+	return id, len(st.entries) - 1
+}
+
+func (st *evidenceState) settle(idx int, result string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if idx >= 0 && idx < len(st.entries) {
+		st.entries[idx].Result = result
+	}
+}
+
+// labeledTool 给每个工具调用打上证据编号：编号写进返回内容开头，
+// 模型在对话里能"看见"自己的证据编号，报告才能正确引用（此前编号只在
+// 落库侧生成，模型只能瞎猜 T1/T2）。
+type labeledTool struct {
+	tool.InvokableTool
+	col *evidenceState
+}
+
+func (t *labeledTool) InvokableRun(ctx context.Context, argsJSON string, opts ...tool.Option) (string, error) {
+	var name string
+	if info, err := t.Info(ctx); err == nil && info != nil {
+		name = info.Name
+	}
+	id, idx := t.col.next(name, argsJSON)
+	res, err := t.InvokableTool.InvokableRun(ctx, argsJSON, opts...)
+	if err != nil {
+		t.col.settle(idx, "error: "+err.Error())
+		return "", err
+	}
+	t.col.settle(idx, res)
+	return "[" + id + "] " + res, nil
+}
+
+func wrapTools(tools []tool.BaseTool, col *evidenceState) []tool.BaseTool {
+	out := make([]tool.BaseTool, len(tools))
+	for i, t := range tools {
+		if inv, ok := t.(tool.InvokableTool); ok {
+			out[i] = &labeledTool{InvokableTool: inv, col: col}
+		} else {
+			out[i] = t
+		}
+	}
+	return out
 }
 
 // Run 执行一次排查。并发安全：无共享可变状态（每次运行独立 agent 实例）。
@@ -89,10 +105,10 @@ func Run(ctx context.Context, in EngineInput) EngineOutput {
 	}
 	st := &evidenceState{}
 	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-		Name:        "diagnosis",
-		Instruction: in.System,
-		Model:       in.Model,
-		ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: in.Tools}},
+		Name:          "diagnosis",
+		Instruction:   in.System,
+		Model:         in.Model,
+		ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: wrapTools(in.Tools, st)}},
 		MaxIterations: in.MaxIter,
 	})
 	if err != nil {
@@ -104,8 +120,7 @@ func Run(ctx context.Context, in EngineInput) EngineOutput {
 	var steps int
 	iter := runner.Run(ctx, &adk.AgentInput{
 		Messages: []*schema.Message{{Role: schema.User, Content: in.User}},
-	}, adk.WithCallbacks(evidenceHandler(st)),
-		adk.WithAfterToolCallsHook(func(context.Context) error { steps++; return nil }))
+	}, adk.WithAfterToolCallsHook(func(context.Context) error { steps++; return nil }))
 
 	out := EngineOutput{}
 	for {

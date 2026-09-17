@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -35,9 +36,31 @@ type StageConfig struct {
 }
 
 type MCPServerConfig struct {
-	Command string            `yaml:"command"`
-	Args    []string          `yaml:"args"`
+	Command string           `yaml:"command"`
+	Args    []string         `yaml:"args"`
 	Env     map[string]string `yaml:"env"`
+}
+
+// ToolsConfig 内置框架工具（exec/read），与 MCP 工具并列装配。
+type ToolsConfig struct {
+	Exec struct {
+		Enabled        bool     `yaml:"enabled"`
+		Backend        string   `yaml:"backend"` // local | docker
+		Allow          []string `yaml:"allow"`   // 二进制白名单（名字或绝对路径）
+		Timeout        string   `yaml:"timeout"` // 单命令超时，如 30s
+		MaxOutputBytes int      `yaml:"max_output_bytes"`
+		Docker         struct {
+			Image    string   `yaml:"image"`   // 空 = 组件默认镜像
+			Network  *bool    `yaml:"network"` // 默认 true（CLI 需要访问 API）
+			MemoryMB int64    `yaml:"memory_mb"`
+			CPU      float64  `yaml:"cpu"`
+			Timeout  string   `yaml:"timeout"` // 容器内单命令超时
+			Env      []string `yaml:"env"`     // 注入容器的环境变量（支持 ${ENV} 展开）
+		} `yaml:"docker"`
+	} `yaml:"exec"`
+	Read struct {
+		Enabled bool `yaml:"enabled"` // read 工具：限定剧本目录内读文件（references 按需加载）
+	} `yaml:"read"`
 }
 
 // Config 框架全部装配入口。
@@ -55,9 +78,13 @@ type Config struct {
 		Dir string `yaml:"dir"`
 	} `yaml:"skills"`
 	MCP struct {
-		Dir     string                      `yaml:"dir"` // 目录式配置：一个 yaml 文件一个 server
-		Servers map[string]MCPServerConfig  `yaml:"servers"`
+		Dir     string                     `yaml:"dir"` // 目录式配置：一个 yaml 文件一个 server
+		Servers map[string]MCPServerConfig `yaml:"servers"`
 	} `yaml:"mcp"`
+	Agent struct {
+		MaxIterations int `yaml:"max_iterations"` // 排查内核模型轮次上限（含工具调用轮）
+	} `yaml:"agent"`
+	Tools ToolsConfig `yaml:"tools"`
 	Policy struct {
 		Execution string `yaml:"execution"` // suggest-only | approval-required | auto+whitelist
 	} `yaml:"policy"`
@@ -114,6 +141,36 @@ func (c *Config) validate() error {
 	}
 	if c.Policy.Execution == "" {
 		c.Policy.Execution = "suggest-only" // P0 一律仅建议
+	}
+	if c.Agent.MaxIterations <= 0 {
+		c.Agent.MaxIterations = 30 // 技能渐进加载 + 资源逐层下钻的合理预算
+	}
+	if te := &c.Tools.Exec; te.Enabled {
+		switch te.Backend {
+		case "":
+			te.Backend = "local"
+		case "local", "docker":
+		default:
+			return fmt.Errorf("tools.exec.backend 非法: %q（local | docker）", te.Backend)
+		}
+		if len(te.Allow) == 0 {
+			return fmt.Errorf("tools.exec.allow 白名单不能为空（enabled 时必须显式放行二进制）")
+		}
+		if te.Timeout == "" {
+			te.Timeout = "30s"
+		}
+		if _, err := time.ParseDuration(te.Timeout); err != nil {
+			return fmt.Errorf("tools.exec.timeout 非法: %q", te.Timeout)
+		}
+		if te.MaxOutputBytes <= 0 {
+			te.MaxOutputBytes = 64 * 1024
+		}
+		if td := &te.Docker; td.Timeout == "" {
+			td.Timeout = te.Timeout
+		}
+		if _, err := time.ParseDuration(te.Docker.Timeout); err != nil {
+			return fmt.Errorf("tools.exec.docker.timeout 非法: %q", te.Docker.Timeout)
+		}
 	}
 	for i, s := range c.Sources {
 		if s.Type == "" {
