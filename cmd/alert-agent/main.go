@@ -21,6 +21,7 @@ import (
 
 	"github.com/cnyup/alert-agent/internal/agent"
 	"github.com/cnyup/alert-agent/internal/config"
+	"github.com/cnyup/alert-agent/internal/execenv"
 	"github.com/cnyup/alert-agent/internal/fanout"
 	"github.com/cnyup/alert-agent/internal/feishu"
 	"github.com/cnyup/alert-agent/internal/llm"
@@ -117,6 +118,7 @@ func main() {
 
 	// 排查内核：reasoner 未配置则优雅降级（管道与落库照常，仅跳过排查）
 	var diagnoser *agent.Runner
+	var execFactory execenv.Factory
 	reasoner, err := llm.New(context.Background(), cfg.LLM.Reasoner)
 	switch {
 	case errors.Is(err, llm.ErrNotConfigured):
@@ -145,8 +147,32 @@ func main() {
 				slog.Info("MCP 工具就绪", "tools", mcpagent.ToolNames(agentTools))
 			}
 		}
-		diagnoser = agent.New(reasoner, agentTools, 12)
-		slog.Info("排查内核就绪")
+		// 内置 exec/read 工具：技能文档即调用规范，CLI 经白名单执行（与后端无关）
+		execFactory, err = execenv.NewFactory(cfg.Tools)
+		if err != nil {
+			slog.Error("exec 工具装配失败", "err", err)
+			os.Exit(1)
+		}
+		if execFactory != nil {
+			t, err := execenv.NewExecTool()
+			if err != nil {
+				slog.Error("exec 工具构造失败", "err", err)
+				os.Exit(1)
+			}
+			agentTools = append(agentTools, t)
+			slog.Info("exec 工具就绪", "backend", cfg.Tools.Exec.Backend, "allow", cfg.Tools.Exec.Allow)
+		}
+		if cfg.Tools.Read.Enabled {
+			t, err := execenv.NewReadTool(cfg.Skills.Dir)
+			if err != nil {
+				slog.Error("read 工具构造失败", "err", err)
+				os.Exit(1)
+			}
+			agentTools = append(agentTools, t)
+			slog.Info("read 工具就绪", "dir", cfg.Skills.Dir)
+		}
+		diagnoser = agent.New(reasoner, agentTools, cfg.Agent.MaxIterations)
+		slog.Info("排查内核就绪", "max_iterations", cfg.Agent.MaxIterations)
 	}
 
 	// 通知器装配
@@ -251,6 +277,16 @@ func main() {
 			slog.Warn("排查内核未启用，事件仅落库", "id", evt.ID)
 			return nil
 		}
+		// 每事件独占执行环境（docker 后端 = 一事件一容器；local 后端无状态共享）
+		if execFactory != nil {
+			env, err := execFactory.Acquire(ctx)
+			if err != nil {
+				slog.Error("执行环境获取失败，跳过排查", "id", evt.ID, "err", err)
+				return nil
+			}
+			defer env.Close(ctx)
+			ctx = execenv.WithEnv(ctx, env)
+		}
 		skill := selectSkill(evt, res.Route)
 		if skill == nil {
 			slog.Warn("无可用剧本（含通用兜底），跳过排查", "id", evt.ID)
@@ -279,7 +315,21 @@ func main() {
 		}
 		if err != nil {
 			slog.Error("排查失败", "id", evt.ID, "skill", skill.Name, "err", err)
-			return nil
+			// 失败也不能静默：降级为失败报告继续走通知，让用户知道排查中断及原因
+			if report == nil {
+				report = &model.DiagnosisReport{}
+			}
+			report.AlertID = evt.ID
+			report.Refs = evt.Refs
+			report.SkillID = skill.Name
+			report.SkillMatched = skill.Name != "generic"
+			if report.Severity == "" {
+				report.Severity = evt.Severity
+			}
+			report.Summary = "排查执行失败：" + truncateStr(err.Error(), 300)
+			report.NeedsHuman = true
+			report.Unresolved = append(report.Unresolved, "排查中断，需人工介入或重试")
+			report.Actions = nil
 		}
 		// 报告本身入 trace
 		if b, err := json.Marshal(report); err == nil {
@@ -512,6 +562,7 @@ func replay(st *store.Store, eventID string) {
 	}
 }
 
+// truncateStr 截断长文本。
 func truncateStr(s string, n int) string {
 	b := []rune(s)
 	if len(b) <= n {
