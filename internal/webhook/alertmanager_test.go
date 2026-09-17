@@ -40,12 +40,15 @@ func TestAlertmanagerParse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 {
-		t.Fatalf("resolved 应被跳过，期望 1 条，实得 %d", len(events))
+	if len(events) != 2 {
+		t.Fatalf("firing+resolved 都应产出，期望 2 条，实得 %d", len(events))
 	}
 	evt := events[0]
 	if evt.Title != "订单服务 5xx 飙升" {
 		t.Fatalf("title 应取 annotations.summary: %q", evt.Title)
+	}
+	if evt.Status != "firing" {
+		t.Fatalf("默认状态应为 firing: %q", evt.Status)
 	}
 	if evt.Severity != "critical" {
 		t.Fatalf("severity 映射错误: %q", evt.Severity)
@@ -64,6 +67,27 @@ func TestAlertmanagerParse(t *testing.T) {
 	}
 	if evt.OccurredAt.Year() != 2026 {
 		t.Fatalf("occurred_at 应来自 startsAt: %v", evt.OccurredAt)
+	}
+}
+
+// resolved 事件：Status 标记 + 与同 labels 的 firing 指纹一致（取消关联的前提）。
+func TestAlertmanagerResolvedFingerprintStable(t *testing.T) {
+	body := `{"version":"4","alerts":[
+		{"status":"firing","labels":{"alertname":"X","service":"s"},"startsAt":"2026-09-15T06:00:00Z"},
+		{"status":"resolved","labels":{"alertname":"X","service":"s"},"startsAt":"2026-09-15T06:00:00Z","endsAt":"2026-09-15T06:05:00Z"}
+	]}`
+	events, err := (&AlertmanagerParser{}).Parse(context.Background(), []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("应产出 2 条: %d", len(events))
+	}
+	if events[0].Status != "firing" || events[1].Status != "resolved" {
+		t.Fatalf("状态标记错误: %s / %s", events[0].Status, events[1].Status)
+	}
+	if events[0].Fingerprint != events[1].Fingerprint {
+		t.Fatal("resolved 与 firing 指纹必须一致（取消关联依赖同指纹）")
 	}
 }
 

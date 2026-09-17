@@ -23,6 +23,7 @@ import (
 	"github.com/cnyup/alert-agent/internal/config"
 	"github.com/cnyup/alert-agent/internal/execenv"
 	"github.com/cnyup/alert-agent/internal/fanout"
+	"github.com/cnyup/alert-agent/internal/inflight"
 	"github.com/cnyup/alert-agent/internal/feishu"
 	"github.com/cnyup/alert-agent/internal/llm"
 	mcpagent "github.com/cnyup/alert-agent/internal/mcp"
@@ -262,6 +263,9 @@ func main() {
 		}
 	}
 
+	// 在途排查注册表：resolved 事件按指纹取消（DESIGN.md §4 取消纪律）
+	inFlight := inflight.New()
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -291,7 +295,72 @@ func main() {
 		return generic
 	}
 
+	// 追问续查：回复报告卡片的自由文本 → 带原事件上下文的二次排查（A5）
+	followup := func(ctx context.Context, eventID, question, chatID string) (string, error) {
+		evt, err := st.GetEvent(ctx, eventID)
+		if err != nil {
+			return "", fmt.Errorf("原事件不存在或已清理: %w", err)
+		}
+		if diagnoser == nil {
+			return "", errors.New("排查内核未启用")
+		}
+		skill := selectSkill(ctx, evt, nil)
+		if skill == nil {
+			return "", errors.New("无可用剧本")
+		}
+		if execFactory != nil {
+			env, err := execFactory.Acquire(ctx)
+			if err != nil {
+				return "", fmt.Errorf("执行环境获取失败: %w", err)
+			}
+			defer env.Close(ctx)
+			ctx = execenv.WithEnv(ctx, env)
+		}
+		extra := "## 人工追问（针对本事件已有报告的续查）\n" + question +
+			"\n请围绕该问题继续排查；已有证据足以回答时可直接作答，新证据须引用工具调用编号。"
+		report, evidence, err := diagnoser.Diagnose(ctx, evt, skill, extra)
+		for i, e := range evidence {
+			_ = st.AppendTrace(ctx, eventID, store.TraceEntry{
+				Seq: 1000 + i, ID: e.ID, Kind: "tool", Name: e.Tool,
+				Input: e.Args, Output: e.Result, At: time.Now().UTC(),
+			})
+		}
+		if err != nil {
+			return "", fmt.Errorf("续查执行失败: %w", err)
+		}
+		if b, err := json.Marshal(report); err == nil {
+			_ = st.AppendTrace(ctx, eventID, store.TraceEntry{
+				Seq: 1500, ID: "R2", Kind: "model", Name: "followup_report",
+				Output: string(b), At: time.Now().UTC(),
+			})
+		}
+		slog.Info("追问续查完成", "event", eventID, "skill", skill.Name,
+			"summary", report.Summary, "needs_human", report.NeedsHuman)
+		var sb strings.Builder
+		sb.WriteString("**追问**：" + question + "\n\n**结论**：" + report.Summary)
+		for i, rc := range report.RootCauses {
+			sb.WriteString(fmt.Sprintf("\n\n根因%d（置信 %.0f%%，证据 %s）：%s",
+				i+1, rc.Confidence*100, strings.Join(rc.Evidence, "/"), rc.Hypothesis))
+		}
+		for _, a := range report.Actions {
+			sb.WriteString(fmt.Sprintf("\n建议 %s[%s]：%s", a.ID, a.Risk, a.Title))
+		}
+		if report.NeedsHuman {
+			sb.WriteString("\n\n⚠️ 需人工介入")
+		}
+		return sb.String(), nil
+	}
+
 	handleEvent := func(ctx context.Context, evt *model.AlertEvent) error {
+		// resolved 相位：不进管道（同指纹会被 dedup 丢弃），取消在途排查后落库留痕
+		if evt.Status == model.StatusResolved {
+			n := inFlight.Cancel(evt.Fingerprint)
+			slog.Info("告警已恢复，取消在途排查", "id", evt.ID, "fingerprint", evt.Fingerprint, "cancelled", n)
+			if err := st.SaveEvent(ctx, evt); err != nil {
+				slog.Error("resolved 事件落库失败", "id", evt.ID, "err", err)
+			}
+			return nil
+		}
 		if err := st.SaveEvent(ctx, evt); err != nil {
 			slog.Error("事件落库失败", "id", evt.ID, "err", err)
 		}
@@ -314,6 +383,11 @@ func main() {
 			slog.Warn("排查内核未启用，事件仅落库", "id", evt.ID)
 			return nil
 		}
+		// 在途登记：resolved 到达时按指纹取消（取消纪律）；排查结束注销
+		diagCtx, diagCancel := context.WithCancel(ctx)
+		unregister := inFlight.Add(evt.Fingerprint, diagCancel)
+		defer func() { unregister(); diagCancel() }()
+		ctx = diagCtx
 		// 每事件独占执行环境（docker 后端 = 一事件一容器；local 后端无状态共享）
 		if execFactory != nil {
 			env, err := execFactory.Acquire(ctx)
@@ -351,6 +425,11 @@ func main() {
 			})
 		}
 		if err != nil {
+			// 被 resolved 取消属正常收敛：静默退出，不发失败卡打扰
+			if errors.Is(err, context.Canceled) {
+				slog.Info("在途排查已被取消（告警恢复）", "id", evt.ID, "skill", skill.Name)
+				return nil
+			}
 			slog.Error("排查失败", "id", evt.ID, "skill", skill.Name, "err", err)
 			// 失败也不能静默：降级为失败报告继续走通知，让用户知道排查中断及原因
 			if report == nil {
@@ -435,6 +514,9 @@ func main() {
 		}); ok {
 			f.SetDecisionHandler(decideHandler)
 			f.SetCardResolver(st.EventIDByCard)
+		}
+		if f, ok := src.(interface{ SetFollowupHandler(feishu.FollowupHandler) }); ok {
+			f.SetFollowupHandler(followup)
 		}
 		go func(name string) {
 			if err := src.Start(ctx, func(ctx context.Context, evt *model.AlertEvent) error {

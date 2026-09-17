@@ -58,11 +58,21 @@ func (l Labels) Canonical() string {
 	return b.String()
 }
 
+// EventStatus 告警生命周期状态（来源侧归一化；不影响 fingerprint——
+// resolved 与 firing 是同一指纹的两个相位）。
+type EventStatus string
+
+const (
+	StatusFiring   EventStatus = "firing"
+	StatusResolved EventStatus = "resolved"
+)
+
 // AlertEvent 统一事件模型：任何来源的告警都必须归一化到该结构（DESIGN.md §2.1）。
 type AlertEvent struct {
 	ID          string            `json:"id"`
 	Fingerprint string            `json:"fingerprint"` // labels 规范化生成 → 去重/聚合键
 	Source      string            `json:"source"`      // 来源插件标识
+	Status      EventStatus       `json:"status"`      // firing | resolved（resolved 不进管道，只做取消）
 	Severity    Severity          `json:"severity"`
 	Title       string            `json:"title"`
 	Description string            `json:"description,omitempty"`
@@ -99,6 +109,7 @@ func NewEvent(source string, sev Severity, title string, labels Labels,
 		ID:          id,
 		Fingerprint: labels.Fingerprint(),
 		Source:      source,
+		Status:      StatusFiring,
 		Severity:    sev,
 		Title:       title,
 		Labels:      labels,
