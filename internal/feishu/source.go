@@ -36,6 +36,10 @@ type DecisionHandler func(ctx context.Context, value map[string]any, operator st
 // CardResolver 卡片 message_id → event_id（main 注入 store 查询）。
 type CardResolver func(messageID string) (eventID string, ok bool)
 
+// FollowupHandler 追问续查处理（main 注入排查内核闭包）：
+// 对已有报告的事件带着追问继续排查，返回跟进卡片文案。
+type FollowupHandler func(ctx context.Context, eventID, question, chatID string) (string, error)
+
 type source struct {
 	appID, appSecret   string
 	verificationToken  string
@@ -45,6 +49,7 @@ type source struct {
 
 	mu       sync.Mutex
 	decide   DecisionHandler
+	followup FollowupHandler
 	resolve  CardResolver
 	seenMsg  map[string]time.Time // message_id 去重（飞书至少一次投递）
 }
@@ -86,6 +91,13 @@ func (s *source) SetDecisionHandler(h DecisionHandler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.decide = h
+}
+
+// SetFollowupHandler 装配期注入追问续查处理。
+func (s *source) SetFollowupHandler(h FollowupHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.followup = h
 }
 
 // SetCardResolver 装配期注入卡片映射查询。
@@ -133,7 +145,7 @@ func (s *source) onMessage(ctx context.Context, ev *larkim.P2MessageReceiveV1, e
 			}
 		}
 	}
-	decide, resolve := s.decide, s.resolve
+	decide, followup, resolve := s.decide, s.followup, s.resolve
 	s.mu.Unlock()
 
 	if msg.MessageType == nil || *msg.MessageType != "text" {
@@ -150,6 +162,13 @@ func (s *source) onMessage(ctx context.Context, ev *larkim.P2MessageReceiveV1, e
 	if cmdID := firstNonEmpty(rootID, parentID); cmdID != "" && isCommand(text) && resolve != nil {
 		if eventID, ok := resolve(cmdID); ok {
 			return s.handleCommand(ctx, eventID, text, chatID, decide)
+		}
+	}
+	// ①b 回复报告卡片 + 自由文本 → 追问续查（带原事件上下文的二次排查）
+	if repID := firstNonEmpty(rootID, parentID); repID != "" && !isCommand(text) &&
+		strings.TrimSpace(text) != "" && followup != nil && resolve != nil {
+		if eventID, ok := resolve(repID); ok {
+			return s.handleFollowup(ctx, eventID, text, chatID, followup)
 		}
 	}
 
@@ -210,6 +229,22 @@ func (s *source) investigateQuoted(ctx context.Context, quotedID, chatID, msgID 
 	}
 	evt.Description = desc
 	return emit(ctx, evt)
+}
+
+// handleFollowup 追问续查：回答经跟进卡片回给来源会话。
+func (s *source) handleFollowup(ctx context.Context, eventID, question, chatID string, h FollowupHandler) error {
+	slog.Info("追问续查", "event", eventID, "text", truncateRunes(question, 60))
+	answer, err := h(ctx, eventID, question, chatID)
+	if err != nil {
+		slog.Error("追问续查失败", "event", eventID, "err", err)
+		answer = "追问处理失败：" + err.Error()
+	}
+	if chatID != "" {
+		if err := s.sendFollowUp(ctx, chatID, answer); err != nil {
+			slog.Error("跟进卡片发送失败", "err", err)
+		}
+	}
+	return nil
 }
 
 // fetchMessage 调用 im API 取一条消息（type, content）。

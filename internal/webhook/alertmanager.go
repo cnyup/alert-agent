@@ -41,10 +41,6 @@ func (*AlertmanagerParser) Parse(_ context.Context, body []byte) ([]*model.Alert
 	}
 	var out []*model.AlertEvent
 	for _, a := range p.Alerts {
-		// P0 只排查 firing；resolved 告警跳过（取消纪律在内核落地后处理）
-		if strings.EqualFold(a.Status, "resolved") {
-			continue
-		}
 		sev := mapSeverity(a.Labels["severity"])
 		title := firstNonEmpty(a.Annotations["summary"], a.Labels["alertname"], "Alertmanager 告警")
 		desc := firstNonEmpty(a.Annotations["description"], a.Annotations["runbook_url"])
@@ -59,6 +55,11 @@ func (*AlertmanagerParser) Parse(_ context.Context, body []byte) ([]*model.Alert
 			return nil, fmt.Errorf("alertmanager: 构造事件失败: %w", err)
 		}
 		evt.Description = desc
+		// resolved 不丢弃：进 Status 字段（不进 labels，指纹与 firing 保持一致），
+		// 由入口层取消同指纹在途排查（DESIGN.md §4 取消纪律）
+		if strings.EqualFold(a.Status, "resolved") {
+			evt.Status = model.StatusResolved
+		}
 		out = append(out, evt)
 	}
 	return out, nil
