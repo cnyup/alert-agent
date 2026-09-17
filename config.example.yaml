@@ -43,15 +43,32 @@ tools:                            # 内置框架工具（技能文档即调用�
     enabled: true
     backend: local                # local（宿主机直跑）| docker（eino-ext 沙箱，一事件一容器）
     allow: ["tt-devops-cli"]      # 白名单必填；名字走 PATH，也可写绝对路径
+    # 只读子命令声明（bin → 词对齐前缀）。排查阶段仅放行命中前缀的命令；
+    # 未命中（含裸二进制）一律按变更拒绝——宁严勿松。变更只能走报告 mutating
+    # 动作 → 人工审批 → 执行。
+    readonly:
+      tt-devops-cli:
+        - databases +doctor          # 本地检查
+        - databases auth             # 认证状态
+        - databases capabilities     # 能力发现
+        - databases resources        # 资源搜索
+        - databases query            # 受控只读查询（validate+execute 均为 SELECT）
+        - databases tickets +get     # 工单查询
+        - alerts +list-rules         # 告警规则查询
+        - alerts +get-rule
+        - promql                     # 指标查询
+        - logs query                 # 日志查询/统计
+        - logs topics
+        - logs alerts +notify-groups
     timeout: 30s                  # 单命令超时（默认）
     max_output_bytes: 65536       # stdout/stderr 截断上限（默认 64KB）
     docker:                       # backend=docker 时生效，均可用默认值
-      image: ""                   # 空 = 组件默认镜像；自定义镜像内需含白名单 CLI
+      image: ""                   # 空 = 组件默认镜像；自定义镜像内需含白名单 CLI（见 deploy/sandbox/Dockerfile）
       network: true               # CLI 需访问 API，默认开（与沙箱组件默认相反）
       memory_mb: 512
       cpu: 1.0
       timeout: 30s
-      env: []                     # 注入容器的环境变量，如 ["TT_API_TOKEN=${TT_API_TOKEN}"]
+      env: []                     # 注入容器的环境变量，如 ["TT_YW_AUTHORIZATION=${TT_YW_AUTHORIZATION}"]
   read:
     enabled: true                 # 限定剧本目录内读文件（references 按需加载）
 

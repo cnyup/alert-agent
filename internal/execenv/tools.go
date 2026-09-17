@@ -20,7 +20,7 @@ func NewExecTool() (tool.InvokableTool, error) {
 		Stdin string   `json:"stdin,omitempty" jsonschema_description:"需要从标准输入喂给命令的内容（如 --input - 要求的 JSON 文档），一般留空"`
 	}
 	return utils.InferTool("exec",
-		"执行白名单内的运维 CLI 命令（如 tt-devops-cli）。按剧本/技能文档的调用规范构造 argv，不经 shell。协议要求 `--input -` 时把 JSON 文档放进 stdin 参数。返回 stdout、stderr 与退出码；退出码非零时先读 stderr 再决定重试或换路径。不要尝试白名单外的解释器（python3/sh 等）。",
+		"执行白名单内的运维 CLI 命令（如 tt-devops-cli）。按剧本/技能文档的调用规范构造 argv，不经 shell；协议要求 `--input -` 时把 JSON 文档放进 stdin 参数。返回 stdout、stderr 与退出码；退出码非零时先读 stderr 再决定重试或换路径。注意：排查阶段仅允许只读子命令（按 tools.exec.readonly 配置分级），变更类命令会被拒绝——变更操作不要重试，应写成报告中 risk=mutating 的动作（tool=exec，args 携带完整 argv 与 stdin），经人工审批后执行。不要尝试白名单外的解释器（python3/sh 等）。",
 		func(ctx context.Context, in input) (Result, error) {
 			env, ok := FromContext(ctx)
 			if !ok {

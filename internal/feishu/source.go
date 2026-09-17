@@ -252,23 +252,103 @@ func extractQuotedAlert(mtype, content string) (title, desc string) {
 		return t, t
 	case "interactive":
 		var c struct {
-			Title struct {
-				Content string `json:"content"`
-			} `json:"title"`
-			Elements []struct {
-				Text *struct {
-					Content string `json:"content"`
-					Tag     string `json:"tag"`
-				} `json:"text"`
-			} `json:"elements"`
+			// title 兼容两种形态：标准卡片 schema 是 {content: ...} 对象，
+			// 部分监控机器人直接发纯字符串（宽松格式兼容，不绑定特定平台）
+			Title json.RawMessage      `json:"title"`
+			Elements []json.RawMessage `json:"elements"`
 		}
-		t := "飞书引用卡片告警"
-		if json.Unmarshal([]byte(content), &c) == nil && c.Title.Content != "" {
-			t = c.Title.Content
+		if json.Unmarshal([]byte(content), &c) != nil {
+			return "飞书引用卡片告警", content
 		}
-		return t, content // 卡片原始 JSON 作为描述，LLM 可解析
+		title := parseCardTitle(c.Title)
+		// 部分机器人的 elements 是 [[{tag,text},...],...] 嵌套数组（分段文本），
+		// 递归展平成可读行文给 keyword 匹配与排查用；原始 JSON 仍留底 raw
+		desc := title + "\n" + flattenCardElements(c.Elements)
+		if strings.TrimSpace(desc) == "" {
+			desc = content
+		}
+		return title, desc
 	default:
 		return "引用消息告警（" + mtype + "）", content
+	}
+}
+
+// parseCardTitle 兼容字符串与 {content} 对象两种 title 形态。
+func parseCardTitle(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return "飞书引用卡片告警"
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		if strings.TrimSpace(s) != "" {
+			return s
+		}
+		return "飞书引用卡片告警"
+	}
+	var obj struct {
+		Content string `json:"content"`
+	}
+	if json.Unmarshal(raw, &obj) == nil && obj.Content != "" {
+		return obj.Content
+	}
+	return "飞书引用卡片告警"
+}
+
+// flattenCardElements 宽松展平卡片元素为可读文本：兼容任意嵌套数组、
+// {tag,text} 文本元素、{text:{content}} 结构与 elements/children 递归——
+// 不假设发送方遵循标准卡片 schema。
+func flattenCardElements(elements []json.RawMessage) string {
+	var sb strings.Builder
+	for _, el := range elements {
+		collectCardText(el, &sb)
+	}
+	return sb.String()
+}
+
+func collectCardText(node any, sb *strings.Builder) {
+	switch v := node.(type) {
+	case string:
+		if s := strings.TrimSpace(v); s != "" {
+			sb.WriteString(s)
+			sb.WriteString("\n")
+		}
+	case []any:
+		for _, x := range v {
+			collectCardText(x, sb)
+		}
+	case []json.RawMessage:
+		for _, x := range v {
+			collectCardText(x, sb)
+		}
+	case json.RawMessage:
+		var arr []any
+		if json.Unmarshal(v, &arr) == nil {
+			collectCardText(arr, sb)
+			return
+		}
+		var obj map[string]any
+		if json.Unmarshal(v, &obj) == nil {
+			collectCardText(obj, sb)
+		}
+	case map[string]any:
+		// text 元素：{"tag":"text","text":"..."} 或 {"text":{"content":"..."}}
+		if s, ok := v["text"].(string); ok && v["tag"] != "img" {
+			if s = strings.TrimSpace(s); s != "" {
+				sb.WriteString(s)
+				sb.WriteString("\n")
+			}
+		}
+		if t, ok := v["text"].(map[string]any); ok {
+			if c, ok := t["content"].(string); ok && strings.TrimSpace(c) != "" {
+				sb.WriteString(c)
+				sb.WriteString("\n")
+			}
+		}
+		for _, k := range []string{"elements", "children"} {
+			if sub, ok := v[k].([]any); ok {
+				collectCardText(sub, sb)
+			}
+		}
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cnyup/alert-agent/internal/config"
+	coremodel "github.com/cnyup/alert-agent/pkg/model"
 )
 
 // Result 一次命令执行的产物（进证据链 T<n> 的内容）。
@@ -26,6 +27,8 @@ type Result struct {
 }
 
 // Env 一次排查独占的执行环境。并发排查各持各的 Env，互不加锁。
+// readOnly=true（排查阶段）时拒绝一切按前缀分类为变更的命令——
+// 变更只能经报告 actions（mutating）→ 审批 → AcquireFull 执行。
 type Env interface {
 	// Run 执行 argv[0] 白名单内的命令；stdin 非空时喂给进程标准输入
 	//（tt-devops-cli 等协议要求复杂输入走 `--input -`）。
@@ -34,8 +37,43 @@ type Env interface {
 }
 
 // Factory 按事件获取 Env：local 返回共享实例（无状态），docker 每次起一个容器。
+// RiskOf 是唯一的风险分类入口：词对齐前缀命中 readonly 配置为只读，
+// 未命中一律 mutating（宁严勿松）。
 type Factory interface {
-	Acquire(ctx context.Context) (Env, error)
+	Acquire(ctx context.Context) (Env, error)       // 排查阶段：只读门禁
+	AcquireFull(ctx context.Context) (Env, error)   // 审批后执行：无只读门禁
+	RiskOf(argv []string) coremodel.ToolRisk
+}
+
+// classify 按 bin 键 + 词对齐前缀（从子命令起算，不含 bin 本身）判定风险：
+// readonly: {tt-devops-cli: ["databases query"]} 命中 [tt-devops-cli databases query +validate ...]；
+// 未命中（含裸二进制调用）一律 mutating——宁严勿松。
+func classify(readonly map[string][]string, argv []string) coremodel.ToolRisk {
+	if len(argv) < 2 {
+		return coremodel.RiskMutating
+	}
+	bin := filepath.Base(strings.TrimPrefix(argv[0], "/"))
+	prefixes := readonly[argv[0]]
+	if prefixes == nil {
+		prefixes = readonly[bin]
+	}
+	for _, p := range prefixes {
+		fields := strings.Fields(p)
+		if len(fields) == 0 || len(fields) > len(argv)-1 {
+			continue
+		}
+		match := true
+		for i, f := range fields {
+			if argv[i+1] != f {
+				match = false
+				break
+			}
+		}
+		if match {
+			return coremodel.RiskReadOnly
+		}
+	}
+	return coremodel.RiskMutating
 }
 
 // ---- ctx 携带 ----
@@ -57,17 +95,25 @@ func FromContext(ctx context.Context) (Env, bool) {
 
 type localEnv struct {
 	resolve map[string]string // argv[0]（名字或绝对路径）→ 可执行文件
+	readonly map[string][]string
+	readOnly bool // 排查阶段 = true，拒绝 mutating 命令
 	timeout time.Duration
 	maxOut  int
 }
 
-type localFactory struct{ env Env }
+type localFactory struct {
+	diag Env // 只读门禁（排查用）
+	full Env // 无门禁（审批后执行用）
+}
 
-func (f *localFactory) Acquire(context.Context) (Env, error) { return f.env, nil }
+func (f *localFactory) Acquire(context.Context) (Env, error)     { return f.diag, nil }
+func (f *localFactory) AcquireFull(context.Context) (Env, error) { return f.full, nil }
+func (f *localFactory) RiskOf(argv []string) coremodel.ToolRisk  { return classify(f.diag.(*localEnv).readonly, argv) }
 
 type dockerFactory struct {
 	cfg      dockerCfg
 	matchSet map[string]bool
+	readonly map[string][]string
 }
 
 type dockerCfg struct {
@@ -100,7 +146,11 @@ func NewFactory(cfg config.ToolsConfig) (Factory, error) {
 			resolve[name] = path
 			resolve[filepath.Base(path)] = path
 		}
-		return &localFactory{env: &localEnv{resolve: resolve, timeout: timeout, maxOut: cfg.Exec.MaxOutputBytes}}, nil
+		base := &localEnv{resolve: resolve, readonly: cfg.Exec.Readonly, readOnly: true, timeout: timeout, maxOut: cfg.Exec.MaxOutputBytes}
+		return &localFactory{
+			diag: base,
+			full: &localEnv{resolve: resolve, readonly: cfg.Exec.Readonly, timeout: timeout, maxOut: cfg.Exec.MaxOutputBytes},
+		}, nil
 	case "docker":
 		dTimeout, err := time.ParseDuration(cfg.Exec.Docker.Timeout)
 		if err != nil {
@@ -130,6 +180,7 @@ func NewFactory(cfg config.ToolsConfig) (Factory, error) {
 				Timeout: dTimeout, Env: cfg.Exec.Docker.Env, MaxOutput: cfg.Exec.MaxOutputBytes,
 			},
 			matchSet: match,
+			readonly: cfg.Exec.Readonly,
 		}, nil
 	default:
 		return nil, fmt.Errorf("execenv: 未知 backend %q", cfg.Exec.Backend)
@@ -168,6 +219,12 @@ func (e *localEnv) usableList() string {
 func (e *localEnv) Run(ctx context.Context, argv []string, stdin string) (Result, error) {
 	if len(argv) == 0 {
 		return e.softErr("argv 不能为空")
+	}
+	if e.readOnly && classify(e.readonly, argv) == coremodel.RiskMutating {
+		return e.softErr(fmt.Sprintf(
+			"命令 %s 按风险分级属于变更类（或未在 tools.exec.readonly 声明为只读），排查阶段禁止执行；"+
+				"如确需变更，请作为 mutating 动作写入报告 actions（tool=exec，args 含完整 argv），经人工审批后执行",
+			strings.Join(argv, " ")))
 	}
 	path, ok := e.resolve[argv[0]]
 	if !ok {

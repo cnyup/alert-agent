@@ -116,6 +116,20 @@ func main() {
 	}
 	slog.Info("剧本索引就绪", "skills", skillIdx.Names())
 
+	// 剧本语义路由（三级路由第二级）：router 小模型未配置则降级为 规则→generic
+	var semRouter *agent.SemanticRouter
+	routerLLM, err := llm.New(context.Background(), cfg.LLM.Router)
+	switch {
+	case errors.Is(err, llm.ErrNotConfigured):
+		slog.Warn("LLM router 未配置，剧本路由为 规则→generic（无语义匹配）")
+	case err != nil:
+		// 路由是增强能力：构造失败降级，不打挂服务
+		slog.Warn("LLM router 构造失败，语义路由禁用", "err", err)
+	default:
+		semRouter = agent.NewSemanticRouter(routerLLM, skillIdx)
+		slog.Info("剧本语义路由就绪")
+	}
+
 	// 排查内核：reasoner 未配置则优雅降级（管道与落库照常，仅跳过排查）
 	var diagnoser *agent.Runner
 	var execFactory execenv.Factory
@@ -195,24 +209,42 @@ func main() {
 		notifiers = append(notifiers, n)
 	}
 
-	// P1 审批状态机：执行器在已装配的 MCP 工具集中按名查找
-	var execTools []tool.BaseTool
-	if diagnoser != nil {
-		execTools = diagnoser.Tools()
-	}
+	// P1 审批状态机：批准后的执行直接走 execenv 全量环境（审批路径的 ctx
+	// 不带排查 Env，也不再从排查工具集按名查找——报告动作的 tool 固定 exec，
+	// argv 存于动作 args）。suggest-only 策略下禁止一切变更执行。
 	policyMgr := policy.New(st, func(ctx context.Context, toolName, argsJSON string) (string, error) {
-		for _, t := range execTools {
-			info, err := t.Info(ctx)
-			if err != nil || info == nil || info.Name != toolName {
-				continue
-			}
-			inv, ok := t.(tool.InvokableTool)
-			if !ok {
-				return "", fmt.Errorf("工具 %s 不可调用", toolName)
-			}
-			return inv.InvokableRun(ctx, argsJSON)
+		if cfg.Policy.Execution == "suggest-only" {
+			return "", fmt.Errorf("当前执行策略为 suggest-only：变更动作仅建议不执行（如需执行请将 policy.execution 配置为 approval-required）")
 		}
-		return "", fmt.Errorf("工具 %s 未装配（检查 mcp.servers 或工具名）", toolName)
+		if toolName != "exec" || execFactory == nil {
+			return "", fmt.Errorf("动作工具 %q 不可执行（当前仅支持 tool=exec 且 args 携带 argv 的动作）", toolName)
+		}
+		var in struct {
+			Argv  []string `json:"argv"`
+			Stdin string   `json:"stdin"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &in); err != nil || len(in.Argv) == 0 {
+			return "", fmt.Errorf("动作 args 缺少可执行 argv（应为 {\"argv\":[...],\"stdin\":\"可选\"}）")
+		}
+		env, err := execFactory.AcquireFull(ctx)
+		if err != nil {
+			return "", fmt.Errorf("执行环境获取失败: %w", err)
+		}
+		defer env.Close(ctx)
+		// 子命令存在性探测：拦截模型臆造的命令（如不存在的 workflows retry），
+		// 避免批准后执行才发现 unknown command
+		if len(in.Argv) >= 2 {
+			probe, err := env.Run(ctx, append(append([]string{}, in.Argv[0], in.Argv[1]), "--help"), "")
+			if err == nil && probe.ExitCode != 0 &&
+				(strings.Contains(probe.Stdout, "unknown command") || strings.Contains(probe.Stderr, "unknown command")) {
+				return "", fmt.Errorf("命令不存在：%s %s（技能文档未记录该命令，请人工经业务平台执行）", in.Argv[0], in.Argv[1])
+			}
+		}
+		res, err := env.Run(ctx, in.Argv, in.Stdin)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("exit=%d\nstdout: %s\nstderr: %s", res.ExitCode, res.Stdout, res.Stderr), nil
 	})
 	decideHandler := func(ctx context.Context, value map[string]any, operator string) (string, error) {
 		kind, _ := value["type"].(string)
@@ -239,8 +271,8 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	// selectSkill 剧本选择：路由指定优先 → 规则匹配 → 通用兜底
-	selectSkill := func(evt *model.AlertEvent, route *pipeline.RouteResult) *skills.Skill {
+	// selectSkill 剧本选择三级路由：路由指定优先 → 规则匹配 → 语义路由 → 通用兜底
+	selectSkill := func(ctx context.Context, evt *model.AlertEvent, route *pipeline.RouteResult) *skills.Skill {
 		if route != nil {
 			for _, name := range route.Skills {
 				if s, ok := skillIdx.Get(name); ok {
@@ -250,6 +282,11 @@ func main() {
 		}
 		if hits := skillIdx.Match(evt); len(hits) > 0 {
 			return hits[0]
+		}
+		if semRouter != nil {
+			if s := semRouter.Select(ctx, evt); s != nil {
+				return s
+			}
 		}
 		return generic
 	}
@@ -287,7 +324,7 @@ func main() {
 			defer env.Close(ctx)
 			ctx = execenv.WithEnv(ctx, env)
 		}
-		skill := selectSkill(evt, res.Route)
+		skill := selectSkill(ctx, evt, res.Route)
 		if skill == nil {
 			slog.Warn("无可用剧本（含通用兜底），跳过排查", "id", evt.ID)
 			return nil
@@ -341,7 +378,26 @@ func main() {
 		slog.Info("排查完成", "id", evt.ID, "skill", skill.Name,
 			"summary", report.Summary, "needs_human", report.NeedsHuman,
 			"steps", report.Cost.Steps, "root_causes", len(report.RootCauses))
-		// P1：mutating 动作进入审批状态机（卡片按钮批准后才执行）
+		// P1：mutating 动作进入审批状态机（卡片按钮批准后才执行）。
+		// 风险归一化：动作携带 argv 时以配置分类（RiskOf）为准——模型标成
+		// read-only 但命令按前缀属变更的，强制提级为 mutating 落审批。
+		if execFactory != nil {
+			for i := range report.Actions {
+				a := &report.Actions[i]
+				if a.Tool != "exec" {
+					continue
+				}
+				var in struct {
+					Argv []string `json:"argv"`
+				}
+				if json.Unmarshal(a.Args, &in) != nil || len(in.Argv) == 0 {
+					continue
+				}
+				if execFactory.RiskOf(in.Argv) == model.RiskMutating {
+					a.Risk = model.RiskMutating
+				}
+			}
+		}
 		if err := policyMgr.CreateApprovals(ctx, report); err != nil {
 			slog.Error("审批创建失败", "id", evt.ID, "err", err)
 		}

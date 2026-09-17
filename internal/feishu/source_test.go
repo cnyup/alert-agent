@@ -65,18 +65,32 @@ func TestExtractQuotedAlert(t *testing.T) {
 	if title != "[FIRING] CPU 使用率 92%" || desc != title {
 		t.Fatalf("text 解析失败: %q", title)
 	}
-	// interactive 卡片：标题 + 原始 JSON 作描述
+	// interactive 卡片：标题 + 展平文本作描述
 	title2, desc2 := extractQuotedAlert("interactive", `{"title":{"content":"🔴 严重告警"},"elements":[{"text":{"content":"CPU 92%","tag":"lark_md"}}]}`)
 	if title2 != "🔴 严重告警" {
 		t.Fatalf("卡片标题提取失败: %q", title2)
 	}
 	if !contains(desc2, "CPU 92%") {
-		t.Fatalf("卡片 JSON 应完整进描述: %q", desc2)
+		t.Fatalf("卡片文本应进描述: %q", desc2)
 	}
 	// post 富文本
 	title3, _ := extractQuotedAlert("post", `{"content":[[{"tag":"text","text":"磁盘告警"},{"tag":"text","text":"：使用率95%"}]]}`)
 	if !contains(title3, "磁盘告警") || !contains(title3, "95%") {
 		t.Fatalf("post 解析失败: %q", title3)
+	}
+	// 非标准形态：title 是纯字符串，elements 是嵌套数组分段文本
+	nonStdCard := `{"title":"恢复 - 生产-AVL短剧出海-整剧工作流失败数>=1","elements":[[{"tag":"text","text":"🎰 对象类型："},{"tag":"text","text":"\n业务自定义指标"},{"tag":"text","text":"🔢 告警级别："}],[{"tag":"text","text":"📋告警内容："},{"tag":"text","text":"\n工作流：原剧边传边处理工作流: 失败数为1 个"}]]}`
+	title4, desc4 := extractQuotedAlert("interactive", nonStdCard)
+	if title4 != "恢复 - 生产-AVL短剧出海-整剧工作流失败数>=1" {
+		t.Fatalf("字符串 title 应被提取: %q", title4)
+	}
+	if !contains(desc4, "业务自定义指标") || !contains(desc4, "失败数为1") || contains(desc4, `{"tag"`) {
+		t.Fatalf("非标准卡 elements 应展平为可读文本: %q", desc4)
+	}
+	// title 缺失回落兜底标题
+	title5, _ := extractQuotedAlert("interactive", `{"elements":[]}`)
+	if title5 != "飞书引用卡片告警" {
+		t.Fatalf("缺 title 应回落兜底: %q", title5)
 	}
 }
 

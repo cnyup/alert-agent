@@ -42,14 +42,15 @@ const reportFormat = `
   "summary": "一句话结论",
   "severity": "critical|warning|info",
   "root_causes": [{"hypothesis": "根因假设", "confidence": 0.0-1.0, "evidence": ["T1","T2"]}],
-  "actions": [{"id": "A1", "title": "建议动作", "risk": "read-only|mutating", "tool": "工具名"}],
+  "actions": [{"id": "A1", "title": "建议动作", "risk": "read-only|mutating", "tool": "exec", "args": {"argv": ["tt-devops-cli", "..."], "stdin": "可选"}, "rollback_hint": "回滚提示（变更类必填）"}],
   "unresolved": ["未解之问"],
   "needs_human": false
 }
 
-硬约束：每个工具调用的返回内容开头都标注了它的证据编号（形如 "[T5] {...}"）；
-root_causes.evidence 只能引用**产出该证据数据**的工具调用编号（如查询执行步），
-不得引用装载文档的 read 步骤；无证据的猜测不得写入。`
+硬约束：
+- 每个工具调用的返回内容开头都标注了它的证据编号（形如 "[T5] {...}"），evidence 只能引用产出该证据数据的编号，不得引用装载文档的 read 步骤；无证据的猜测不得写入；
+- 动作 tool 一律为 "exec"。仅当已加载的技能文档**明确记录**了对应命令时才携带 args（{"argv":[...],"stdin":"可选"}，与文档逐字一致）；技能文档没有的变更能力，写成不带 args 的人工路径动作（title 注明"需人工经 XX 平台执行"），严禁虚构子命令；
+- risk=mutating 且带 args 的动作经人工审批后由系统执行；排查阶段的 exec 仅允许只读子命令，变更类命令会被拒绝——不要在排查中重试变更命令。`
 
 // Tools 返回排查内核持有的工具集（审批执行器按名查找用）。
 func (r *Runner) Tools() []tool.BaseTool { return r.tools }

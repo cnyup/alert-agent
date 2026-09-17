@@ -22,6 +22,10 @@ func TestDockerBackend(t *testing.T) {
 	c.Exec.Enabled = true
 	c.Exec.Backend = "docker"
 	c.Exec.Allow = []string{"echo", "cat", "tt-devops-cli"}
+	// 只读前缀：CLI 探针走排查门禁；echo/cat 机制探针走全量环境
+	c.Exec.Readonly = map[string][]string{
+		"tt-devops-cli": {"databases +doctor", "databases resources"},
+	}
 	c.Exec.Timeout = "60s"
 	c.Exec.MaxOutputBytes = 65536
 	c.Exec.Docker.Image = "tt-devops-cli-sandbox:1.0.15"
@@ -33,35 +37,46 @@ func TestDockerBackend(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	env, err := f.Acquire(ctx)
+	gated, err := f.Acquire(ctx) // 排查门禁环境
 	if err != nil {
 		t.Fatalf("容器启动失败（Docker 未运行或镜像缺失？）: %v", err)
 	}
-	defer env.Close(ctx)
+	defer gated.Close(ctx)
 
-	// 基础：argv 直执行
-	res, err := env.Run(ctx, []string{"echo", "hi"}, "")
-	if err != nil || res.Stdout != "hi\n" {
-		t.Fatalf("echo: err=%v res=%+v", err, res)
-	}
 	// 白名单软失败
-	res, err = env.Run(ctx, []string{"python3", "-c", "x"}, "")
+	res, err := gated.Run(ctx, []string{"python3", "-c", "x"}, "")
 	if err != nil || res.ExitCode != -2 || !strings.Contains(res.Stderr, "不在白名单内") {
 		t.Fatalf("白名单: err=%v res=%+v", err, res)
 	}
+	// 只读门禁：未声明前缀的命令在排查环境被拒
+	res, err = gated.Run(ctx, []string{"echo", "hi"}, "")
+	if err != nil || res.ExitCode != -2 || !strings.Contains(res.Stderr, "变更类") {
+		t.Fatalf("只读门禁: err=%v res=%+v", err, res)
+	}
+
+	full, err := f.AcquireFull(ctx) // 审批后全量环境（独立容器）
+	if err != nil {
+		t.Fatalf("全量容器启动失败: %v", err)
+	}
+	defer full.Close(ctx)
+	// 基础：argv 直执行
+	res, err = full.Run(ctx, []string{"echo", "hi"}, "")
+	if err != nil || res.Stdout != "hi\n" {
+		t.Fatalf("echo: err=%v res=%+v", err, res)
+	}
 	// stdin 链路：cat 回显（不依赖 CLI/token）
-	res, err = env.Run(ctx, []string{"cat"}, `{"probe":"stdin"}`)
+	res, err = full.Run(ctx, []string{"cat"}, `{"probe":"stdin"}`)
 	if err != nil || res.Stdout != `{"probe":"stdin"}` {
 		t.Fatalf("stdin: err=%v res=%+v", err, res)
 	}
 	// CLI 真实调用（需 token）
 	if os.Getenv("TT_YW_AUTHORIZATION") != "" {
-		res, err = env.Run(ctx,
+		res, err = gated.Run(ctx,
 			[]string{"tt-devops-cli", "databases", "+doctor"}, "")
 		if err != nil || strings.Contains(res.Stdout, `"success": false`) {
 			t.Fatalf("doctor: err=%v res=%.200s", err, res.Stdout)
 		}
-		res, err = env.Run(ctx,
+		res, err = gated.Run(ctx,
 			[]string{"tt-devops-cli", "databases", "resources", "+search", "--input", "-"},
 			`{"resource_type":"instance","query":"allvoice","capability":"readonly_query","page":{"limit":3}}`)
 		if err != nil || strings.Contains(res.Stdout, `"success": false`) {
