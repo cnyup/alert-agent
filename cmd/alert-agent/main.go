@@ -185,8 +185,8 @@ func main() {
 			agentTools = append(agentTools, t)
 			slog.Info("read 工具就绪", "dir", cfg.Skills.Dir)
 		}
-		diagnoser = agent.New(reasoner, agentTools, cfg.Agent.MaxIterations)
-		slog.Info("排查内核就绪", "max_iterations", cfg.Agent.MaxIterations)
+		diagnoser = agent.New(reasoner, agentTools, cfg.Agent.MaxIterations, cfg.Agent.MaxTokens)
+		slog.Info("排查内核就绪", "max_iterations", cfg.Agent.MaxIterations, "max_tokens", cfg.Agent.MaxTokens)
 	}
 
 	// 通知器装配

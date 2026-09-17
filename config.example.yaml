@@ -37,6 +37,7 @@ mcp:
 
 agent:
   max_iterations: 30             # 排查内核模型轮次上限（技能文档加载+CLI 下钻都计入）
+  max_tokens: 0                  # 单次排查 token 上限（in+out 累计），0=不限；超限熔断产出部分结论
 
 tools:                            # 内置框架工具（技能文档即调用规范）
   exec:                           # 白名单 CLI 执行（如 tt-devops-cli）

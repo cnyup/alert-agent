@@ -84,6 +84,7 @@ type Config struct {
 	} `yaml:"mcp"`
 	Agent struct {
 		MaxIterations int `yaml:"max_iterations"` // 排查内核模型轮次上限（含工具调用轮）
+		MaxTokens     int `yaml:"max_tokens"`     // 单次排查 token 上限（in+out），<=0 不限；超限熔断产出部分结论
 	} `yaml:"agent"`
 	Tools ToolsConfig `yaml:"tools"`
 	Policy struct {

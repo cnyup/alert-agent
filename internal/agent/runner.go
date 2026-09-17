@@ -18,19 +18,21 @@ import (
 	coremodel "github.com/cnyup/alert-agent/pkg/model"
 )
 
-// Runner 排查内核。零内部可变状态，并发安全。
+// Runner 排查内核。零内部可变状态（token 计量在包装模型内，自带锁），并发安全。
 type Runner struct {
 	reasoner model.BaseModel[*schema.Message]
+	meter    *tokenModel
 	tools    []tool.BaseTool // P0：MCP 接入前为空集（剧本收权在空集上恒安全）
 	maxIter  int
 }
 
-// New 构造排查内核。
-func New(reasoner model.BaseModel[*schema.Message], tools []tool.BaseTool, maxIter int) *Runner {
+// New 构造排查内核。maxTokens<=0 表示不限量。
+func New(reasoner model.BaseModel[*schema.Message], tools []tool.BaseTool, maxIter, maxTokens int) *Runner {
 	if maxIter <= 0 {
 		maxIter = 12
 	}
-	return &Runner{reasoner: reasoner, tools: tools, maxIter: maxIter}
+	meter := newTokenModel(reasoner, maxTokens)
+	return &Runner{reasoner: meter, meter: meter, tools: tools, maxIter: maxIter}
 }
 
 // reportFormat 强制最终回答为可解析的报告 JSON（证据链引用 T<n> 编号）。
@@ -113,6 +115,9 @@ func (r *Runner) Diagnose(ctx context.Context, evt *coremodel.AlertEvent, skill 
 		rep.Severity = evt.Severity
 	}
 	rep.Cost = coremodel.ReportCost{Steps: out.Steps, DurationMs: time.Since(start).Milliseconds()}
+	if r.meter != nil {
+		rep.Cost.TokensIn, rep.Cost.TokensOut = r.meter.usage()
+	}
 	if err := rep.Validate(); err != nil {
 		return rep, out.Evidence, fmt.Errorf("agent: 报告未过契约校验: %w", err)
 	}
