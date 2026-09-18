@@ -119,6 +119,44 @@ func (s *Store) GetEvent(ctx context.Context, id string) (*model.AlertEvent, err
 	return &evt, nil
 }
 
+// LatestEventByFingerprint 取同指纹最近一条事件（去重提示/重查关联用）；
+// excludeID 排除调用方自身（被 dedup drop 的事件也已落库且最新）。
+func (s *Store) LatestEventByFingerprint(ctx context.Context, fp, excludeID string) (*model.AlertEvent, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, fingerprint, source, severity, title, description, labels, raw, refs, occurred_at, received_at
+		FROM events WHERE fingerprint = ? AND id != ? ORDER BY received_at DESC LIMIT 1`, fp, excludeID)
+	evt, err := scanEvent(row)
+	if err != nil {
+		return nil, fmt.Errorf("store: 按指纹取最近事件失败: %w", err)
+	}
+	return evt, nil
+}
+
+type rowScanner interface{ Scan(dest ...any) error }
+
+func scanEvent(row rowScanner) (*model.AlertEvent, error) {
+	var (
+		evt    model.AlertEvent
+		labels string
+		refs   sql.NullString
+		raw    sql.NullString
+		desc   sql.NullString
+	)
+	if err := row.Scan(&evt.ID, &evt.Fingerprint, &evt.Source, &evt.Severity, &evt.Title, &desc,
+		&labels, &raw, &refs, &evt.OccurredAt, &evt.ReceivedAt); err != nil {
+		return nil, err
+	}
+	evt.Description = desc.String
+	evt.Raw = json.RawMessage(raw.String)
+	if refs.Valid && refs.String != "" {
+		_ = json.Unmarshal([]byte(refs.String), &evt.Refs)
+	}
+	if labels != "" {
+		_ = json.Unmarshal([]byte(labels), &evt.Labels)
+	}
+	return &evt, nil
+}
+
 // AppendTrace 追加一条 trace 记录（Seq 由调用方编排，通常递增计数器）。
 func (s *Store) AppendTrace(ctx context.Context, eventID string, e TraceEntry) error {
 	b, err := json.Marshal(e)
