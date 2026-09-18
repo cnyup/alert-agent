@@ -1,0 +1,26 @@
+# pg-conn-exhaust 剧本评测集（框架示例）
+# 跑法：alert-agent -config config.yaml -eval          # 路由档（零 LLM 成本）
+#       alert-agent -config config.yaml -eval full     # 完整排查档（每 case 一次真实 LLM）
+- name: pg-英文关键词命中
+  alert:
+    title: "PostgreSQL too many connections"
+    description: "剩余连接数不足 5%"
+    labels: {service: pg-main, env: prod}
+    severity: critical
+  assert:
+    route: pg-conn-exhaust
+- name: pg-labels命中
+  alert:
+    title: "数据库连接异常"
+    labels: {component: postgres, env: prod}
+    severity: warning
+  assert:
+    route: pg-conn-exhaust
+- name: 无关告警不误命中
+  alert:
+    title: "CDN 证书即将过期"
+    description: "网关证书剩余 7 天"
+    labels: {service: gateway}
+    severity: warning
+  assert:
+    route: generic

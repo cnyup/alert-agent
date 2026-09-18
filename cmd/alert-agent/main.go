@@ -18,9 +18,12 @@ import (
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
+	"gopkg.in/yaml.v3"
 
 	"github.com/cnyup/alert-agent/internal/agent"
 	"github.com/cnyup/alert-agent/internal/config"
+	einoengine "github.com/cnyup/alert-agent/internal/agent/eino"
+	"github.com/cnyup/alert-agent/internal/eval"
 	"github.com/cnyup/alert-agent/internal/execenv"
 	"github.com/cnyup/alert-agent/internal/fanout"
 	"github.com/cnyup/alert-agent/internal/inflight"
@@ -47,6 +50,8 @@ func main() {
 		showVer    = flag.Bool("version", false, "打印版本")
 		replayID   = flag.String("replay", "", "回放指定事件的 trace 后退出")
 		distill    = flag.Bool("distill", false, "把人工反馈蒸馏为剧本修订建议后退出")
+		evalSpec   = flag.String("eval", "", "剧本评测：路由档（默认）/ full=完整排查；如 -eval 或 -eval full")
+		evalAddID  = flag.String("eval-add", "", "从指定真实事件沉淀评测 case（写 skills/<命中剧本>/evals/cases.yaml）")
 	)
 	flag.Parse()
 	if *showVer {
@@ -81,6 +86,15 @@ func main() {
 	// replay 模式：读库打印事件与全链路 trace，退出
 	if *replayID != "" {
 		replay(st, *replayID)
+		return
+	}
+
+	// eval-add 模式：真实事件 → 评测 case（金样例沉淀，脱敏只保留结构与断言）
+	if *evalAddID != "" {
+		if err := runEvalAdd(st, cfg, *evalAddID); err != nil {
+			slog.Error("评测 case 沉淀失败", "err", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -261,6 +275,25 @@ func main() {
 		default:
 			return "", fmt.Errorf("未知按钮类型 %q", kind)
 		}
+	}
+
+	// pickSkill 评测复用的三级路由取剧本（返回完整对象含 Body）。
+	pickSkill := func(ctx context.Context, evt *model.AlertEvent) *skills.Skill {
+		if hits := skillIdx.Match(evt); len(hits) > 0 {
+			return hits[0]
+		}
+		if semRouter != nil {
+			if s := semRouter.Select(ctx, evt); s != nil {
+				return s
+			}
+		}
+		return generic
+	}
+
+	// eval 模式：剧本评测（D1）。route 档零 LLM 成本；full 档每 case 一次真实排查。
+	if *evalSpec != "" {
+		runEval(*evalSpec == "full", cfg, pickSkill, diagnoser, execFactory)
+		return
 	}
 
 	// 在途排查注册表：resolved 事件按指纹取消（DESIGN.md §4 取消纪律）
@@ -699,6 +732,135 @@ func replay(st *store.Store, eventID string) {
 		}
 		fmt.Println(line)
 	}
+}
+
+// runEval 剧本评测执行：engine 复用生产装配（路由/排查与线上一致）。
+func runEval(full bool, cfg *config.Config,
+	pick func(context.Context, *model.AlertEvent) *skills.Skill,
+	diagnoser *agent.Runner, execFactory execenv.Factory) {
+	cases, err := eval.LoadCases(cfg.Skills.Dir)
+	if err != nil {
+		slog.Error("评测集装载失败", "err", err)
+		os.Exit(1)
+	}
+	if len(cases) == 0 {
+		fmt.Println("（无评测 case：在 skills/<剧本>/evals/cases.yaml 添加，或用 -eval-add 从真实事件沉淀）")
+		return
+	}
+	route := func(ctx context.Context, evt *model.AlertEvent) string {
+		return pick(ctx, evt).Name
+	}
+	var rs []eval.Result
+	if !full {
+		rs = eval.RunRoute(context.Background(), cases, route)
+	} else {
+		if diagnoser == nil {
+			slog.Error("full 档需要排查内核（LLM reasoner 未配置）")
+			os.Exit(1)
+		}
+		eng := &prodEvalEngine{pick: pick, diagnoser: diagnoser, execFactory: execFactory}
+		rs = eval.RunFull(context.Background(), cases, eng)
+	}
+	fmt.Println(eval.ReportSummary(rs))
+	for _, r := range rs {
+		if !r.Passed {
+			os.Exit(1)
+		}
+	}
+}
+
+// prodEvalEngine 生产装配的评测引擎（full 档）。
+type prodEvalEngine struct {
+	pick        func(context.Context, *model.AlertEvent) *skills.Skill
+	diagnoser   *agent.Runner
+	execFactory execenv.Factory
+}
+
+func (e *prodEvalEngine) Route(ctx context.Context, evt *model.AlertEvent) string { return e.pick(ctx, evt).Name }
+
+func (e *prodEvalEngine) Diagnose(ctx context.Context, evt *model.AlertEvent) (*model.DiagnosisReport, []einoengine.Evidence, error) {
+	if e.execFactory != nil {
+		env, err := e.execFactory.Acquire(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer env.Close(context.Background())
+		ctx = execenv.WithEnv(ctx, env)
+	}
+	// 与生产同构：注入命中剧本全文（Body 含纪律与输出契约）
+	return e.diagnoser.Diagnose(ctx, evt, e.pick(ctx, evt), "")
+}
+
+// runEvalAdd 从真实事件沉淀评测 case：取事件载荷与当时命中的剧本，
+// 生成最小断言（路由命中 + 首个 exec 形态），人工再补强。
+func runEvalAdd(st *store.Store, cfg *config.Config, eventID string) error {
+	ctx := context.Background()
+	evt, err := st.GetEvent(ctx, eventID)
+	if err != nil {
+		return fmt.Errorf("事件不存在: %w", err)
+	}
+	trace, err := st.Trace(ctx, eventID)
+	if err == nil {
+		_ = trace // 证据细节人工补充；这里只沉淀路由与形态基线
+	}
+	skillName := "generic"
+	if trace, terr := st.Trace(ctx, eventID); terr == nil {
+		for _, e := range trace {
+			if e.ID != "R1" {
+				continue
+			}
+			var rep struct {
+				SkillID string `json:"skill_id"`
+			}
+			if json.Unmarshal([]byte(e.Output), &rep) == nil && rep.SkillID != "" {
+				skillName = rep.SkillID
+			}
+		}
+	}
+	name := fmt.Sprintf("%s-%s", evt.Title, time.Now().Format("0102-1504"))
+	labels := model.Labels{}
+	for k, v := range evt.Labels { // 滤掉消息级 labels（单条消息指纹，进 case 无意义）
+		if k == "via" || k == "chat_id" || k == "alert_key" {
+			continue
+		}
+		labels[k] = v
+	}
+	c := eval.Case{
+		Name: truncateStr(name, 60),
+		Alert: eval.AlertSpec{
+			Title:       evt.Title,
+			Description: truncateStr(evt.Description, 400),
+			Labels:      labels,
+			Severity:    string(evt.Severity),
+		},
+		Assert: eval.AssertSpec{Route: skillName},
+	}
+	dir := filepath.Join(cfg.Skills.Dir, skillName, "evals")
+	if err := os.MkdirAll(dir, 0o755); skillName != "generic" && err != nil {
+		return err
+	}
+	// generic 命中写到 _generic/evals（LoadCases 跳过 _ 前缀目录——统一放 examples 根）
+	if skillName == "generic" {
+		dir = filepath.Join(cfg.Skills.Dir, "_generic", "evals")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	p := filepath.Join(dir, "cases.yaml")
+	var existing []eval.Case
+	if b, err := os.ReadFile(p); err == nil {
+		_ = yaml.Unmarshal(b, &existing)
+	}
+	existing = append(existing, c)
+	b, err := yaml.Marshal(existing)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("已沉淀 case：%s → %s（断言基线：route=%s；请按当时的 trace 补强 StepsLe/FirstExecPrefix 等）\n", c.Name, p, skillName)
+	return nil
 }
 
 // truncateStr 截断长文本。
