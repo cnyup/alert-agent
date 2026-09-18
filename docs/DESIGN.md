@@ -379,14 +379,18 @@ Eino 相关 import 全部收在 `internal/agent/eino/` 隔离层内。
 
 ## 10. 零代码路线（用户目标形态：只写 SKILL.md + 配置）
 
-| # | 项 | 现状 → 目标 |
-|---|-----|------------|
-| N1 | 通知渠道插件集（钉钉/企业微信/webhook-out） | 仅飞书+log → 照 feishu 包各一文件，配置即用 |
-| N2 | 告警源插件集（钉钉/企微机器人入向） | 仅飞书+webhook → source 插件 |
-| N3 | 解析器补齐（grafana / jmespath / regex） | 仅 alertmanager（§2.2 承诺兑现） |
-| N4 | MCP 工具风险分级与审批执行对齐 exec 水位 | MCP 仅剧本收权，readonly/mutating 声明与批准后执行未覆盖 |
-| U0 | 配置 API 化 + 热加载（配置中心前置） | 现为 YAML 启动加载一次 → REST CRUD + 校验复用 validate |
-| U1 | Web 配置中心（skills/工具/入口/管道/运行视图） | 依赖 U0；Skill 管理与评测按钮（U2）基于 §9 评测引擎 |
+| # | 项 | 状态 | 说明 |
+|---|-----|------|------|
+| N5 | 文档同步至 v0.6 | ✅ 完成（2026-09-18） | 本文档 + README 面向零代码用户重写 |
+| N3 | 解析器补齐（grafana / jmespath / regex） | ✅ 完成（2026-09-18，`a34cdca`） | grafana 双形态固定格式；jmespath 表达式全字段投影（构造期编译校验）；regex 命名捕获组；webhook 源 `parse_options` + ConfiguredParser 注册制——**任意报文零代码接入已成立** |
+| N1 | 通知渠道插件集（钉钉/企业微信/webhook-out） | 待开发 | 仅飞书+log → 照 feishu 包各一 notifier，配置即用 |
+| N2 | 告警源插件集（钉钉/企微机器人入向） | 待开发 | 仅飞书+webhook → source 插件 |
+| N4 | MCP 工具风险分级与审批执行对齐 exec 水位 | 待开发 | MCP 仅剧本收权；readonly/mutating 声明（MCPServerConfig 加风险标注）与批准后执行未覆盖 |
+| U0 | 配置 API 化 + 热加载（配置中心前置） | 待开发 | 现为 YAML 启动加载一次 → REST CRUD（skills/mcp/sources/notifiers/pipeline）+ 校验复用 validate |
+| U1 | Web 配置中心 | 待开发（依赖 U0） | Skill 管理（列表/编辑/评测按钮）、工具配置（MCP/CLI 白名单+readonly）、入口与渠道（凭据走 ${ENV} 引用）、管道编排、运行视图（metrics 图 + 事件/trace 查询，后端能力已全有） |
 
-遗留（外部协调）：Agent 专用 token（个人凭证需替换）、远程部署（linux-x64
-镜像 + 正式配置）、GitLab 技能库回写、蒸馏闭环实测（feedback 攒量）。
+遗留（外部协调，不阻塞开发）：**C2** Agent 专用 token（替换个人凭证）、
+**C1** 远程部署（linux-x64 沙箱镜像 + 正式配置 C4，部署时本地实例需停——
+飞书长连接互斥）、**D3** GitLab 技能库回写（db_info 实例映射/索引纪律/
+模板修正）、**D2** 蒸馏闭环实测（群内回复 认领/误报/根因确认 攒 feedback，
+当前 0 条）。
