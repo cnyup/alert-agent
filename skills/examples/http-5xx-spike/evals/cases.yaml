@@ -1,0 +1,16 @@
+# http-5xx-spike 剧本评测集（框架示例）
+- name: 5xx-关键词命中
+  alert:
+    title: "订单服务 5xx 激增"
+    description: "5 分钟错误率超 5%"
+    labels: {service: order-api, env: prod}
+    severity: critical
+  assert:
+    route: http-5xx-spike
+- name: 5xx-不误吞pg告警
+  alert:
+    title: "PostgreSQL too many connections"
+    labels: {service: pg}
+    severity: warning
+  assert:
+    route_not: [http-5xx-spike]

@@ -21,6 +21,12 @@ test:
 lint:
 	go vet ./...
 
+eval-route: build             # 剧本评测·路由档（零 LLM 成本，可常跑）
+	./bin/$(BINARY) -config config.yaml -eval route
+
+eval-full: build              # 剧本评测·完整档（每 case 一次真实 LLM 排查，改剧本时跑）
+	./bin/$(BINARY) -config config.yaml -eval full
+
 run: build
 	./bin/$(BINARY) -config config.yaml
 
