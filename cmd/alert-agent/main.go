@@ -262,6 +262,8 @@ func main() {
 		}
 		return fmt.Sprintf("exit=%d\nstdout: %s\nstderr: %s", res.ExitCode, res.Stdout, res.Stderr), nil
 	})
+	var followup feishu.FollowupHandler // 定义在源装配前（A5 追问续查），decideHandler 的重查指令引用
+
 	decideHandler := func(ctx context.Context, value map[string]any, operator string) (string, error) {
 		kind, _ := value["type"].(string)
 		eventID, _ := value["event_id"].(string)
@@ -273,6 +275,9 @@ func main() {
 			return policyMgr.Decide(ctx, eventID, actionID, false, operator)
 		case "claim", "false-positive", "root-confirmed":
 			return policyMgr.Feedback(ctx, eventID, kind, operator)
+		case "recheck":
+			return followup(ctx, eventID,
+				"请对该告警重新执行完整排查（时间窗以当前时刻回溯），刷新证据后给出最新结论。", "")
 		default:
 			return "", fmt.Errorf("未知按钮类型 %q", kind)
 		}
@@ -340,8 +345,11 @@ func main() {
 		return pickSkill(ctx, evt)
 	}
 
+	// feishuSend 由源装配期注入（dedup 命中引用类事件的提示卡发送）
+	var feishuSend func(context.Context, string, string) error
+
 	// 追问续查：回复报告卡片的自由文本 → 带原事件上下文的二次排查（A5）
-	followup := func(ctx context.Context, eventID, question, chatID string) (string, error) {
+	followup = func(ctx context.Context, eventID, question, chatID string) (string, error) {
 		evt, err := st.GetEvent(ctx, eventID)
 		if err != nil {
 			return "", fmt.Errorf("原事件不存在或已清理: %w", err)
@@ -422,6 +430,10 @@ func main() {
 		if res.Dropped {
 			reg.Inc("alert_agent_events_dropped_total", res.DropBy)
 			slog.Info("事件被管道终止", "id", evt.ID, "stage", res.DropBy, "title", evt.Title)
+			// 引用是人的主动动作：同卡被 dedup 合并时不能沉默，回提示卡并引导重查
+			if evt.Source == "feishu/quote" && res.DropBy == "dedup" && feishuSend != nil {
+				notifyDedupHit(ctx, evt, feishuSend, st)
+			}
 			return nil
 		}
 		slog.Info("事件通过管道", "id", evt.ID, "severity", evt.Severity, "title", evt.Title)
@@ -586,6 +598,11 @@ func main() {
 		}
 		if f, ok := src.(interface{ SetFollowupHandler(feishu.FollowupHandler) }); ok {
 			f.SetFollowupHandler(followup)
+		}
+		if f, ok := src.(interface {
+			SendFollowUp(context.Context, string, string) error
+		}); ok {
+			feishuSend = f.SendFollowUp
 		}
 		go func(name string) {
 			if err := src.Start(ctx, func(ctx context.Context, evt *model.AlertEvent) error {
@@ -896,6 +913,39 @@ func runEvalAdd(st *store.Store, cfg *config.Config, eventID string) error {
 	}
 	fmt.Printf("已沉淀 case：%s → %s（断言基线：route=%s；请按当时的 trace 补强 StepsLe/FirstExecPrefix 等）\n", c.Name, p, skillName)
 	return nil
+}
+
+// notifyDedupHit 引用类事件被去重合并：取同指纹最近排查结论，回提示卡并引导"重查"。
+// 文案携带事件 ID 明文——引用该卡 + 指令文本（如"重查"）也能定位事件（引用与回复是两个入口）。
+func notifyDedupHit(ctx context.Context, evt *model.AlertEvent,
+	send func(context.Context, string, string) error, st *store.Store) {
+	chatID := evt.Refs["feishu_chat_id"]
+	if chatID == "" {
+		return
+	}
+	text := fmt.Sprintf("该告警卡片在去重窗口内已排查过，本次引用已合并，未重复排查。\n（事件 %s）\n如需以当前时刻重新排查，请回复本卡：**重查**", evt.ID)
+	if prev, err := st.LatestEventByFingerprint(ctx, evt.Fingerprint, evt.ID); err == nil && prev.ID != "" {
+		if trace, terr := st.Trace(ctx, prev.ID); terr == nil {
+			for _, e := range trace {
+				if e.ID != "R1" {
+					continue
+				}
+				var rep struct {
+					Summary string `json:"summary"`
+				}
+				if json.Unmarshal([]byte(e.Output), &rep) == nil && rep.Summary != "" {
+					text = fmt.Sprintf("该卡片 %s 已排查过（本次引用在去重窗口内被合并）：\n\n**上次结论**：%s\n\n（事件 %s）\n如需以当前时刻重新排查，请回复本卡：**重查**",
+						prev.ReceivedAt.Local().Format("15:04"), truncateStr(rep.Summary, 200), prev.ID)
+					break
+				}
+			}
+		}
+	}
+	sendCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := send(sendCtx, chatID, text); err != nil {
+		slog.Error("去重提示卡发送失败", "id", evt.ID, "err", err)
+	}
 }
 
 // truncateStr 截断长文本。

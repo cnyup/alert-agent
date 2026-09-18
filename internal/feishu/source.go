@@ -29,8 +29,9 @@ func init() {
 }
 
 // DecisionHandler 闭环指令处理（main 注入 policy.Manager 闭包）。
-// value: {"type":"approve|reject|claim|false-positive|root-confirmed",
+// value: {"type":"approve|reject|claim|false-positive|root-confirmed|recheck",
 //         "event_id":..., "action_id":...}；返回跟进文案。
+// recheck（重查）走追问续查通道：带原事件上下文重新排查。
 type DecisionHandler func(ctx context.Context, value map[string]any, operator string) (string, error)
 
 // CardResolver 卡片 message_id → event_id（main 注入 store 查询）。
@@ -184,9 +185,16 @@ func (s *source) onMessage(ctx context.Context, ev *larkim.P2MessageReceiveV1, e
 		}
 	}
 
-	// ② 引用消息排查（设计初衷场景）：被引用的消息内容作为告警
+	// ② 引用消息排查（设计初衷场景）：被引用的消息内容作为告警；
+	// 特例——引用闭环提示卡/报告 + 指令文本（如"重查"）：被引内容含事件 ID 时
+	// 分发为该事件的闭环指令（用户可能用"引用"而非"回复"，两个入口都接）。
 	if quotedID := firstNonEmpty(parentID, rootID); quotedID != "" {
 		if resolve == nil || func() bool { _, ok := resolve(quotedID); return !ok }() {
+			if isCommand(text) && decide != nil {
+				if eventID := s.eventIDFromQuoted(ctx, quotedID); eventID != "" {
+					return s.handleCommand(ctx, eventID, text, chatID, decide)
+				}
+			}
 			return s.investigateQuoted(ctx, quotedID, chatID, msgID, emit)
 		}
 	}
@@ -231,6 +239,17 @@ func (s *source) investigateQuoted(ctx context.Context, quotedID, chatID, msgID 
 	return emit(ctx, evt)
 }
 
+var reEventID = regexp.MustCompile(`evt_[A-Z0-9]{20,32}`)
+
+// eventIDFromQuoted 从被引消息内容提取事件 ID（提示卡/报告卡文案携带）。
+func (s *source) eventIDFromQuoted(ctx context.Context, quotedID string) string {
+	_, content, err := s.fetchMessage(ctx, quotedID)
+	if err != nil {
+		return ""
+	}
+	return reEventID.FindString(content)
+}
+
 // handleFollowup 追问续查：回答经跟进卡片回给来源会话。
 func (s *source) handleFollowup(ctx context.Context, eventID, question, chatID string, h FollowupHandler) error {
 	slog.Info("追问续查", "event", eventID, "text", truncateRunes(question, 60))
@@ -273,7 +292,11 @@ func extractQuotedAlert(mtype, content string) (title, desc string) {
 		var c struct {
 			Text string `json:"text"`
 		}
-		if json.Unmarshal([]byte(content), &c) == nil && c.Text != "" {
+		if json.Unmarshal([]byte(content), &c) == nil {
+			// 清 @占位符；清后仅剩空白的"空引用"回落原文（含占位），由调用方判无可解析内容
+			if t := extractText(content); strings.TrimSpace(t) != "" {
+				return t, t
+			}
 			return c.Text, c.Text
 		}
 		return content, content
@@ -429,12 +452,14 @@ var (
 	reClaim     = regexp.MustCompile(`(?i)^(认领|claim)$`)
 	reFalsePos  = regexp.MustCompile(`(?i)^(误报|false.?positive)$`)
 	reConfirm   = regexp.MustCompile(`(?i)^(根因确认|确认根因|confirm)$`)
+	reRecheck   = regexp.MustCompile(`(?i)^(重查|重新排查|recheck|re-?run)$`)
 )
 
 func isCommand(text string) bool {
 	t := strings.TrimSpace(text)
 	return reApprove.MatchString(t) || reReject.MatchString(t) ||
-		reClaim.MatchString(t) || reFalsePos.MatchString(t) || reConfirm.MatchString(t)
+		reClaim.MatchString(t) || reFalsePos.MatchString(t) || reConfirm.MatchString(t) ||
+		reRecheck.MatchString(t)
 }
 
 func (s *source) handleCommand(ctx context.Context, eventID, text, chatID string, decide DecisionHandler) error {
@@ -451,6 +476,8 @@ func (s *source) handleCommand(ctx context.Context, eventID, text, chatID string
 		value = map[string]any{"type": "false-positive", "event_id": eventID}
 	case reConfirm.MatchString(t):
 		value = map[string]any{"type": "root-confirmed", "event_id": eventID}
+	case reRecheck.MatchString(t):
+		value = map[string]any{"type": "recheck", "event_id": eventID}
 	default:
 		return nil
 	}

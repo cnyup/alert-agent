@@ -78,7 +78,8 @@ func (r *Runner) Diagnose(ctx context.Context, evt *coremodel.AlertEvent, skill 
 	}
 
 	evtJSON, _ := json.MarshalIndent(evt, "", "  ")
-	userMsg := "排查以下告警：\n" + string(evtJSON)
+	userMsg := "排查以下告警：\n" + string(evtJSON) +
+		"\n\n注意：occurred_at/received_at 为 UTC；业务库时间列为北京时间。查询 SQL 的时间字面量一律使用北京时间（UTC+8 换算），含查询窗口的推理与计算。"
 	if extraContext != "" {
 		userMsg += "\n\n## 管道上下文\n" + extraContext
 	}

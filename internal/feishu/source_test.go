@@ -17,8 +17,12 @@ func TestCommandParsing(t *testing.T) {
 		{"误报", true, "false-positive", ""},
 		{"根因确认", true, "root-confirmed", ""},
 		{"确认根因", true, "root-confirmed", ""},
+		{"重查", true, "recheck", ""},
+		{"重新排查", true, "recheck", ""},
+		{"recheck", true, "recheck", ""},
 		{"服务器炸了快看看", false, "", ""},
 		{"批准一下那个发布", false, "", ""}, // 模糊文本不算指令（要求精确格式）
+		{"帮我重查一下", false, "", ""},   // 模糊文本仍不算指令（追问通道处理）
 	}
 	for _, c := range cases {
 		if got := isCommand(c.in); got != c.isCmd {
@@ -43,6 +47,8 @@ func TestCommandParsing(t *testing.T) {
 			typ = "false-positive"
 		case reConfirm.MatchString(c.in):
 			typ = "root-confirmed"
+		case reRecheck.MatchString(c.in):
+			typ = "recheck"
 		}
 		if typ != c.typ || act != c.act {
 			t.Errorf("parse(%q) = %s/%s, want %s/%s", c.in, typ, act, c.typ, c.act)
