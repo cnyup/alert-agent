@@ -41,6 +41,8 @@ import (
 
 	// 内置源插件集：init() 注册工厂
 	_ "github.com/cnyup/alert-agent/internal/webhook"
+	// 声明式解析器集（grafana 固定格式 + jmespath/regex 表达式映射）
+	_ "github.com/cnyup/alert-agent/internal/parsers"
 )
 
 var version = "dev"

@@ -17,7 +17,29 @@ llm:
 sources:
   - type: webhook
     path: /hooks/alertmanager
-    parse: alertmanager                # 内置解析器：alertmanager（grafana/jmespath/regex 规划中，见 DESIGN §10）
+    parse: alertmanager                # 内置解析器：alertmanager / grafana（固定格式）
+  # Grafana Alerting 直接对接
+  # - type: webhook
+  #   path: /hooks/grafana
+  #   parse: grafana
+  # 任意 JSON 报文零代码接入：JMESPath 表达式映射（构造期编译校验，配置错误启动即报）
+  # - type: webhook
+  #   path: /hooks/custom
+  #   parse: jmespath
+  #   parse_options:
+  #     title: "alerts[0].name"            # 必填：标题投影
+  #     description: "alerts[0].msg"
+  #     severity: "alerts[0].level"        # critical|warning|info
+  #     status: "alerts[0].state"          # resolved 值 → 触发在途取消
+  #     occurred_at: "alerts[0].ts"        # RFC3339 / Unix 秒 / 毫秒
+  #     labels: {service: "alerts[0].svc", env: "alerts[0].env"}
+  # 文本类报文：命名捕获组正则
+  # - type: webhook
+  #   path: /hooks/text
+  #   parse: regex
+  #   parse_options:
+  #     pattern: '(?P<title>[\w\s]+) on (?P<host>\S+): (?P<description>.+)'
+  #     labels: [host]                      # 声明哪些捕获组进 labels（进指纹）
 
 pipeline:                              # 顺序可配、可增删
   - stage: dedup
