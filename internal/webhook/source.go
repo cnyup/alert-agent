@@ -25,6 +25,13 @@ type Parser interface {
 	Parse(ctx context.Context, body []byte) ([]*model.AlertEvent, error)
 }
 
+// ConfiguredParser 需要用户配置的解析器（jmespath/regex）实现的可选接口：
+// source 装配时若注册表未命中则尝试按 parse_options 构造。
+type ConfiguredParser interface {
+	Parser
+	Configure(opts map[string]any) (Parser, error)
+}
+
 var (
 	parserMu sync.RWMutex
 	parsers  = map[string]Parser{}
@@ -48,9 +55,30 @@ func LookupParser(name string) (Parser, bool) {
 	return p, ok
 }
 
+var (
+	configuredMu sync.RWMutex
+	configured   = map[string]ConfiguredParser{}
+)
+
+// RegisterConfiguredParser 注册带配置解析器的原型（Configure 产出实例）。
+func RegisterConfiguredParser(name string, proto ConfiguredParser) {
+	configuredMu.Lock()
+	defer configuredMu.Unlock()
+	configured[name] = proto
+}
+
+// LookupConfigured 按名查找带配置解析器原型。
+func LookupConfigured(name string) (ConfiguredParser, bool) {
+	configuredMu.RLock()
+	defer configuredMu.RUnlock()
+	p, ok := configured[name]
+	return p, ok
+}
+
 type source struct {
 	path   string
 	parse  string
+	parser Parser // 解析器实例：注册表查找，或按 parse_options 构造（jmespath/regex）
 	mux    *http.ServeMux
 	server *http.Server
 }
@@ -58,6 +86,9 @@ type source struct {
 type sourceOptions struct {
 	Path   string `json:"path"`   // 如 /hooks/alertmanager
 	Parse string `json:"parse"`  // 解析器名：alertmanager / grafana / jmespath / regex
+	// 带配置解析器的构造参数（jmespath: 表达式映射；regex: pattern+捕获组声明），
+	// 原样传给 ConfiguredParser 工厂
+	ParseOptions map[string]any `json:"parse_options"`
 }
 
 // SetMux 注入主服务的路由表（装配期由 main 调用，webhook 源把自己的
@@ -75,10 +106,22 @@ func newSource(opts map[string]any) (plugin.Source, error) {
 	if o.Parse == "" {
 		return nil, fmt.Errorf("webhook: parse 不能为空")
 	}
-	if _, ok := LookupParser(o.Parse); !ok {
-		return nil, fmt.Errorf("webhook: 解析器 %q 未注册", o.Parse)
+	var parser Parser
+	if p, ok := LookupParser(o.Parse); ok {
+		parser = p
+	} else {
+		// 注册表未命中 → 尝试带配置构造（jmespath/regex 等声明式解析器）
+		cp, ok := LookupConfigured(o.Parse)
+		if !ok {
+			return nil, fmt.Errorf("webhook: 解析器 %q 未注册", o.Parse)
+		}
+		instance, err := cp.Configure(o.ParseOptions)
+		if err != nil {
+			return nil, fmt.Errorf("webhook: 解析器 %q 构造失败: %w", o.Parse, err)
+		}
+		parser = instance
 	}
-	return &source{path: o.Path, parse: o.Parse}, nil
+	return &source{path: o.Path, parse: o.Parse, parser: parser}, nil
 }
 
 func (*source) Name() string { return "webhook" }
@@ -93,8 +136,7 @@ func (s *source) Start(ctx context.Context, emit plugin.EmitFunc) error {
 			http.Error(w, "read body failed", http.StatusBadRequest)
 			return
 		}
-		parser, _ := LookupParser(s.parse)
-		events, err := parser.Parse(req.Context(), body)
+		events, err := s.parser.Parse(req.Context(), body)
 		if err != nil {
 			slog.Warn("webhook 报文解析失败", "path", s.path, "parse", s.parse, "err", err)
 			http.Error(w, "parse failed", http.StatusBadRequest)
