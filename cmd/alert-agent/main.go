@@ -231,7 +231,7 @@ func main() {
 		if err != nil {
 			return "", fmt.Errorf("执行环境获取失败: %w", err)
 		}
-		defer env.Close(ctx)
+		defer env.Close(context.Background())
 		// 子命令存在性探测：拦截模型臆造的命令（如不存在的 workflows retry），
 		// 避免批准后执行才发现 unknown command
 		if len(in.Argv) >= 2 {
@@ -395,7 +395,8 @@ func main() {
 				slog.Error("执行环境获取失败，跳过排查", "id", evt.ID, "err", err)
 				return nil
 			}
-			defer env.Close(ctx)
+			// 清理用独立 ctx：排查 ctx 被 resolved 取消时 Docker API 不能随之失败（容器会残留）
+			defer env.Close(context.Background())
 			ctx = execenv.WithEnv(ctx, env)
 		}
 		skill := selectSkill(ctx, evt, res.Route)
