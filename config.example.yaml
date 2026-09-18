@@ -17,7 +17,7 @@ llm:
 sources:
   - type: webhook
     path: /hooks/alertmanager
-    parse: alertmanager                # 内置解析器：alertmanager / grafana / jmespath / regex
+    parse: alertmanager                # 内置解析器：alertmanager（grafana/jmespath/regex 规划中，见 DESIGN §10）
 
 pipeline:                              # 顺序可配、可增删
   - stage: dedup
