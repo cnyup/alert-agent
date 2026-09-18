@@ -29,6 +29,7 @@ import (
 	"github.com/cnyup/alert-agent/internal/inflight"
 	"github.com/cnyup/alert-agent/internal/feishu"
 	"github.com/cnyup/alert-agent/internal/llm"
+	"github.com/cnyup/alert-agent/internal/metrics"
 	mcpagent "github.com/cnyup/alert-agent/internal/mcp"
 	_ "github.com/cnyup/alert-agent/internal/notifier" // 注册内置通知器（log + feishu-card）
 	"github.com/cnyup/alert-agent/internal/pipeline"
@@ -277,16 +278,33 @@ func main() {
 		}
 	}
 
-	// pickSkill 评测复用的三级路由取剧本（返回完整对象含 Body）。
+	// 自身可观测性（C3）：/metrics，Prometheus 文本格式
+	reg := metrics.New()
+	reg.MustCounter("alert_agent_events_total", "接收的告警事件数", "source", "status")
+	reg.MustCounter("alert_agent_events_dropped_total", "被管道终止的事件数", "stage")
+	reg.MustCounter("alert_agent_route_total", "剧本路由分级计数", "tier")
+	reg.MustCounter("alert_agent_diagnosis_total", "排查完成计数", "skill", "result")
+	reg.MustCounter("alert_agent_diagnosis_seconds_total", "排查耗时累计（秒）", "skill")
+	reg.MustCounter("alert_agent_diagnosis_steps_total", "排查步数累计", "skill")
+	reg.MustCounter("alert_agent_diagnosis_tokens_total", "排查 token 消耗累计", "direction")
+	reg.MustGauge("alert_agent_inflight_diagnoses", "在途排查数")
+	reg.MustCounter("alert_agent_notifications_total", "通知发送计数", "result")
+
+	// pickSkill 三级路由取剧本（评测复用；返回完整对象含 Body），埋路由分级指标。
 	pickSkill := func(ctx context.Context, evt *model.AlertEvent) *skills.Skill {
 		if hits := skillIdx.Match(evt); len(hits) > 0 {
+			reg.Inc("alert_agent_route_total", "rule")
 			return hits[0]
 		}
 		if semRouter != nil {
 			if s := semRouter.Select(ctx, evt); s != nil {
+				reg.Inc("alert_agent_route_total", "semantic")
 				return s
 			}
+			reg.Inc("alert_agent_route_total", "generic")
+			return generic
 		}
+		reg.Inc("alert_agent_route_total", "generic")
 		return generic
 	}
 
@@ -307,25 +325,19 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	mux.Handle("GET /metrics", reg.Handler())
 
 	// selectSkill 剧本选择三级路由：路由指定优先 → 规则匹配 → 语义路由 → 通用兜底
 	selectSkill := func(ctx context.Context, evt *model.AlertEvent, route *pipeline.RouteResult) *skills.Skill {
 		if route != nil {
 			for _, name := range route.Skills {
 				if s, ok := skillIdx.Get(name); ok {
+					reg.Inc("alert_agent_route_total", "route_rule")
 					return s
 				}
 			}
 		}
-		if hits := skillIdx.Match(evt); len(hits) > 0 {
-			return hits[0]
-		}
-		if semRouter != nil {
-			if s := semRouter.Select(ctx, evt); s != nil {
-				return s
-			}
-		}
-		return generic
+		return pickSkill(ctx, evt)
 	}
 
 	// 追问续查：回复报告卡片的自由文本 → 带原事件上下文的二次排查（A5）
@@ -385,9 +397,11 @@ func main() {
 	}
 
 	handleEvent := func(ctx context.Context, evt *model.AlertEvent) error {
+		reg.Inc("alert_agent_events_total", evt.Source, string(evt.Status))
 		// resolved 相位：不进管道（同指纹会被 dedup 丢弃），取消在途排查后落库留痕
 		if evt.Status == model.StatusResolved {
 			n := inFlight.Cancel(evt.Fingerprint)
+			reg.SetGauge("alert_agent_inflight_diagnoses", int64(inFlight.Len()))
 			slog.Info("告警已恢复，取消在途排查", "id", evt.ID, "fingerprint", evt.Fingerprint, "cancelled", n)
 			if err := st.SaveEvent(ctx, evt); err != nil {
 				slog.Error("resolved 事件落库失败", "id", evt.ID, "err", err)
@@ -406,6 +420,7 @@ func main() {
 			})
 		}
 		if res.Dropped {
+			reg.Inc("alert_agent_events_dropped_total", res.DropBy)
 			slog.Info("事件被管道终止", "id", evt.ID, "stage", res.DropBy, "title", evt.Title)
 			return nil
 		}
@@ -419,7 +434,13 @@ func main() {
 		// 在途登记：resolved 到达时按指纹取消（取消纪律）；排查结束注销
 		diagCtx, diagCancel := context.WithCancel(ctx)
 		unregister := inFlight.Add(evt.Fingerprint, diagCancel)
-		defer func() { unregister(); diagCancel() }()
+		reg.SetGauge("alert_agent_inflight_diagnoses", int64(inFlight.Len()))
+		diagStart := time.Now()
+		defer func() {
+			unregister()
+			diagCancel()
+			reg.SetGauge("alert_agent_inflight_diagnoses", int64(inFlight.Len()))
+		}()
 		ctx = diagCtx
 		// 每事件独占执行环境（docker 后端 = 一事件一容器；local 后端无状态共享）
 		if execFactory != nil {
@@ -461,9 +482,12 @@ func main() {
 		if err != nil {
 			// 被 resolved 取消属正常收敛：静默退出，不发失败卡打扰
 			if errors.Is(err, context.Canceled) {
+				reg.Inc("alert_agent_diagnosis_total", "cancelled", skill.Name)
 				slog.Info("在途排查已被取消（告警恢复）", "id", evt.ID, "skill", skill.Name)
 				return nil
 			}
+			reg.Inc("alert_agent_diagnosis_total", "failed", skill.Name)
+			reg.Add("alert_agent_diagnosis_seconds_total", time.Since(diagStart).Milliseconds()/1000, skill.Name)
 			slog.Error("排查失败", "id", evt.ID, "skill", skill.Name, "err", err)
 			// 失败也不能静默：降级为失败报告继续走通知，让用户知道排查中断及原因
 			if report == nil {
@@ -488,6 +512,15 @@ func main() {
 				Output: string(b), At: time.Now().UTC(),
 			})
 		}
+		result := "ok"
+		if report.NeedsHuman {
+			result = "needs_human"
+		}
+		reg.Inc("alert_agent_diagnosis_total", result, skill.Name)
+		reg.Add("alert_agent_diagnosis_seconds_total", time.Since(diagStart).Milliseconds()/1000, skill.Name)
+		reg.Add("alert_agent_diagnosis_steps_total", int64(report.Cost.Steps), skill.Name)
+		reg.Add("alert_agent_diagnosis_tokens_total", int64(report.Cost.TokensIn), "in")
+		reg.Add("alert_agent_diagnosis_tokens_total", int64(report.Cost.TokensOut), "out")
 		slog.Info("排查完成", "id", evt.ID, "skill", skill.Name,
 			"summary", report.Summary, "needs_human", report.NeedsHuman,
 			"steps", report.Cost.Steps, "root_causes", len(report.RootCauses))
@@ -529,6 +562,8 @@ func main() {
 		} else if len(failed) > 0 {
 			slog.Error("通知重试后仍失败", "channels", failed)
 		}
+		reg.Add("alert_agent_notifications_total", int64(len(targets)-len(failed)), "ok")
+		reg.Add("alert_agent_notifications_total", int64(len(failed)), "failed")
 		return nil
 	}
 
