@@ -100,6 +100,8 @@ policy:
 
 notifiers:
   - type: feishu-card
+    app_id: ${FEISHU_APP_ID}
+    app_secret: ${FEISHU_APP_SECRET}
     chat_id: ${FEISHU_CHAT_ID}
 
 store:
