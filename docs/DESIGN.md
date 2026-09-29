@@ -308,12 +308,14 @@ alert-agent/
 │   ├── pipeline/             # 线性 stages 引擎（P2 升级 xdag）
 │   ├── agent/                # DiagnosisRunner：剧本装配/收权/预算/证据链
 │   │   └── eino/             # Eino 集成隔离层（ChatModelAgent + callbacks）
+│   ├── caseflow/             # Case 级多轮调查编排（Supervisor/Reducer/恢复，零 eino）
+│   ├── dispatch/             # 持久队列 worker 池（SQLite jobs 真源 + 唤醒信号）
 │   ├── llm/                  # router/reasoner 双客户端（eino-ext model）
 │   ├── mcp/                  # MCP server 装配（eino-ext mcp 适配器）
 │   ├── feishu/               # 飞书 source + notifier + 卡片回调
 │   ├── webhook/              # 通用 webhook source + 解析器集
 │   ├── policy/               # 执行策略层（审批状态机/白名单）
-│   └── store/                # SQLite（events / traces / feedback / approvals）
+│   └── store/                # SQLite（events/traces/feedback/approvals/jobs/cases）
 ├── pkg/
 │   ├── model/                # AlertEvent / DiagnosisReport 契约（公开）
 │   └── plugin/               # Source/Notifier/Stage 接口 + 注册函数（公开）
@@ -323,7 +325,9 @@ alert-agent/
 ```
 
 `pkg/` 只放插件作者需要引用的契约与接口；其余实现全部 `internal/`。
-Eino 相关 import 全部收在 `internal/agent/eino/` 隔离层内。
+Eino import 边界由守卫测试固化（internal/imports_test.go）：仅
+`internal/{agent,agent/eino,llm,mcp,execenv}` 白名单可 import eino，
+caseflow/store/webhook/feishu/pipeline/policy/dispatch 与 cmd/ 一律禁止。
 
 ## 7. 一条告警的完整链路（示例）
 
@@ -394,3 +398,29 @@ Eino 相关 import 全部收在 `internal/agent/eino/` 隔离层内。
 飞书长连接互斥）、**D3** GitLab 技能库回写（db_info 实例映射/索引纪律/
 模板修正）、**D2** 蒸馏闭环实测（群内回复 认领/误报/根因确认 攒 feedback，
 当前 0 条）。
+
+## 11. Case Supervisor：多轮调查编排（v0.7，2026-09-30 落地）
+
+单轮排查（§4）的延伸：复杂告警一轮收敛不了——报告带未解之问、证据指向
+其他领域、根因置信不足。CaseSupervisor 在单事件粒度上驱动多轮：
+
+- **四态循环**：`FINISH`（收敛成稿）/ `CONTINUE`（同剧本续查）/
+  `SWITCH`（证据指向他域换剧本；连续 ≥2 次强制升级人工——防不收敛）/
+  `ESCALATE`（needs_human、轮数硬顶仍有未决事项、Case 预算熔断）。
+- **Judge 条件触发**（成本纪律，非每轮）：max(根因置信) < 阈值（默认 0.6）
+  或 critical 或无根因时，评审产出缺口清单进 open items 驱动续查。
+- **Reducer**：CaseState 唯一写者——根因（置信 ≥0.5）累积为跨轮 Facts，
+  注入后续轮上下文；token 按轮累计对 Case 预算负责。
+- **持久化**：`cases`（状态/轮次/Facts）+ `case_rounds`（每轮 attempt：
+  running→completed/failed，input_state 快照为崩溃恢复点）。
+- **崩溃恢复**：轮级重跑（非栈级恢复）——启动扫描超时 running attempt →
+  回滚 → Case 重新入队。依赖审批幂等（Wave 0.2：终态永不回退 pending，
+  重跑不重复建审批）。明确不引入 Eino checkpoint/Redis。
+- **入口异步化**（同批落地）：webhook/feishu emit 改为 SQLite jobs 持久队列
+  入队即返回；分钟级排查在 dispatch worker 池内跑，与 HTTP req ctx 彻底
+  解耦（客户端断连不再杀排查）；队列深度超限入口 503 不静默丢。
+- **渐进启用**：`caseflow.enabled: false`（默认）时行为与单轮完全等价；
+  开启后 handleEvent 排查段走 RunCase。eino 类型边界守卫测试固化
+  （caseflow/dispatch/store 等 14 包 + cmd 零 eino import）。
+
+架构细节与波次执行记录见 docs/PLAN-CASE-SUPERVISOR.md。

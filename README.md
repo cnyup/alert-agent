@@ -16,9 +16,11 @@ LLM 按剧本排查（三级路由 + 双通道工具，证据链强制可回放�
 - **双通道工具**（剧本 `tools:` 统一收权）：
   - `exec`/`read` 内置工具：技能文档即调用规范——白名单 CLI 按 argv 执行（stdin 支持），宿主机或 **Docker 沙箱**（一事件一容器，凭证 runtime 注入不落镜像层）；`read` 按需加载技能 references
   - MCP server：`mcp/<name>.yaml` 目录式接入任意 stdio server
-- **风险分级（fail-closed）**：`tools.exec.readonly` 词对齐前缀声明只读子命令，未声明一律按变更拒绝；变更动作（mutating）必须携带与技能文档逐字一致的 argv，经审批后执行（含子命令存在性探测，拦截臆造命令）
+- **风险分级（fail-closed）**：`tools.exec.readonly` 词对齐前缀声明只读子命令，未声明一律按变更拒绝；变更动作（mutating）必须携带与技能文档逐字一致的 argv，经审批后执行（含子命令存在性探测，拦截臆造命令）；审批终态幂等（executed/rejected 永不回退 pending，并发双击恰好执行一次）
 - **证据链强制**：每次工具调用带 `[T<n>]` 编号返回，报告结论必须引用产出数据的编号；全链路落 SQLite，`-replay` 回放
-- **预算与取消**：`max_iterations` / `max_tokens` 超限产出部分结论；告警恢复（resolved）按指纹取消在途排查
+- **预算与取消**：`max_iterations` / `max_tokens`（单次调查独立计量）超限产出部分结论；告警恢复（resolved）按指纹取消在途排查
+- **持久队列入口**：webhook/飞书事件入 SQLite jobs 即返回，排查在 worker 池内跑——客户端断连不影响在途排查；队列深度超限返回 503（不静默丢）
+- **Case 多轮编排**（可选，`caseflow.enabled`）：FINISH/CONTINUE/SWITCH/ESCALATE 四态循环——未解之问续查、证据指向他域换剧本（连续 2 次强制升级人工）、低置信/无根因触发 Judge 评审缺口、轮级崩溃恢复（attempt 快照重跑）；默认关闭时行为与单轮等价
 - **人机闭环**：回复/引用报告卡 `认领` / `误报` / `根因确认` / `批准 A1` / `重查`（带上下文续查）；追问续查；同卡重复引用回提示卡不沉默
 - **越用越准**：`-distill` 把人工反馈蒸馏为剧本修订建议（不自动生效）；**评测集**回归验证剧本修订不退化
 

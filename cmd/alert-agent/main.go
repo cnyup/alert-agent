@@ -629,6 +629,10 @@ func main() {
 			} else {
 				reg.Inc("alert_agent_dispatch_failed_total", j.Kind)
 			}
+			// 队列深度 gauge（Wave 5.2）
+			if n, qerr := st.QueueDepth(context.Background()); qerr == nil {
+				reg.SetGauge("alert_agent_queue_depth", int64(n))
+			}
 		},
 	})
 	pool.Register("webhook_event", func(ctx context.Context, j *store.Job) error {
