@@ -78,7 +78,17 @@ func (r *Runner) Diagnose(ctx context.Context, evt *coremodel.AlertEvent, skill 
 	}
 
 	evtJSON, _ := json.MarshalIndent(evt, "", "  ")
+	// 时间锚点：模型无法感知"现在"，epoch 换算只能靠训练记忆猜年份（实测两年间
+	// 同月日的窗口会差整一年且毫不自知）。注入 Diagnose 时刻的多种时间表示，
+	// 并给出强制校验规则——治根于排查上下文层，技能文档护栏只是补丁。
+	now := time.Now()
+	bj := now.In(time.FixedZone("CST", 8*3600))
 	userMsg := "排查以下告警：\n" + string(evtJSON) +
+		fmt.Sprintf("\n\n当前时间（排查开始时刻）：UTC %s｜北京时间 %s｜epoch 秒 %d｜epoch 毫秒 %d。"+
+			"凡把时间换算为 epoch 时间戳（命令的 --from/--to 等参数），必须先与本锚点比对："+
+			"正确的换算结果与当前时间的差距应在告警窗口量级（分钟到小时级）；相差接近整数年（约 ±365 天）即为年份算错，重新换算后再调用，禁止直接使用。",
+			now.UTC().Format("2006-01-02 15:04:05"), bj.Format("2006-01-02 15:04:05"),
+			now.Unix(), now.UnixMilli()) +
 		"\n\n注意：occurred_at/received_at 为 UTC；业务库时间列为北京时间。查询 SQL 的时间字面量一律使用北京时间（UTC+8 换算），含查询窗口的推理与计算。"
 	if extraContext != "" {
 		userMsg += "\n\n## 管道上下文\n" + extraContext

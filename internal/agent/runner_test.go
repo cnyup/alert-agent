@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,24 +27,84 @@ type turn struct {
 }
 
 type fakeModel struct {
-	mu    sync.Mutex
-	turns []turn
-	next  int
+	mu       sync.Mutex
+	turns    []turn
+	next     int
+	firstUser string // 首轮收到的 user 消息原文（时间锚点断言用）
 }
 
-func (m *fakeModel) Generate(_ context.Context, _ []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+func (m *fakeModel) Generate(_ context.Context, msgs []*schema.Message, _ ...model.Option) (*schema.Message, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.next >= len(m.turns) {
+		m.mu.Unlock()
 		return nil, errors.New("脚本耗尽")
+	}
+	if len(msgs) > 0 { // 记录首轮 user 消息供断言（时间锚点注入验证；ADK 可能前置 System/Instruction 消息）
+		for _, msg := range msgs {
+			if msg.Role == schema.User {
+				m.firstUser = msg.Content
+				break
+			}
+		}
 	}
 	t := m.turns[m.next]
 	m.next++
+	m.mu.Unlock()
 	if len(t.calls) > 0 {
 		return &schema.Message{Role: schema.Assistant, ToolCalls: t.calls}, nil
 	}
 	return &schema.Message{Role: schema.Assistant, Content: t.content}, nil
 }
+
+// TestDiagnoseInjectsTimeAnchor 验证首轮 user 消息注入当前时间锚点：
+// 模型做 epoch 换算时有真实的「现在」可对照（防止年份差一年的系统性错误）。
+func TestDiagnoseInjectsTimeAnchor(t *testing.T) {
+	fm := &fakeModel{turns: []turn{
+		{calls: []schema.ToolCall{
+			{ID: "c1", Function: schema.FunctionCall{Name: "prometheus_query", Arguments: `{"q":"up"}`}},
+		}},
+		{content: `{"summary":"ok","severity":"warning",
+			"root_causes":[{"hypothesis":"h","confidence":0.5,"evidence":["T1"]}],
+			"needs_human":true}`},
+	}}
+	skill := loadSkill(t)
+	skill = &skills.Skill{Name: skill.Name, Description: skill.Description,
+		Triggers: skill.Triggers, Severity: skill.Severity,
+		Tools: []string{"prometheus_query"}, Body: skill.Body}
+
+	evt, _ := coremodel.NewEvent("webhook/alertmanager", coremodel.SeverityWarning,
+		"测试告警", coremodel.Labels{"a": "b"}, time.Now(), nil, nil)
+
+	r := New(fm, []tool.BaseTool{&fakeTool{name: "prometheus_query"}}, 4, 0)
+	if _, _, err := r.Diagnose(context.Background(), evt, skill, ""); err != nil {
+		t.Fatalf("排查失败: %v", err)
+	}
+	u := fm.firstUser
+	if u == "" {
+		t.Fatal("未捕获首轮 user 消息")
+	}
+	// 必须含北京时间和 UTC 的当前时间、epoch 秒与毫秒锚点
+	now := time.Now()
+	for _, want := range []string{
+		"当前时间", now.Format("2006-01-02"),
+	} {
+		if !strings.Contains(u, want) {
+			t.Errorf("userMsg 缺少 %q:\n%s", want, u)
+		}
+	}
+	// epoch 毫秒锚点：注入值应与真实当前毫秒在同一分钟量级（Diagnose 时刻取的）
+	if !strings.Contains(u, "epoch") {
+		t.Error("userMsg 缺少 epoch 时间戳锚点")
+	}
+	anchorRe := regexp.MustCompile(`epoch 毫秒[：:]?\s*(\d{13})`)
+	if m := anchorRe.FindStringSubmatch(u); m == nil {
+		t.Error("userMsg 未找到 13 位 epoch 毫秒锚点")
+	} else if got, _ := strconv.ParseInt(m[1], 10, 64); abs64(now.UnixMilli()-got) > 5*60*1000 {
+		t.Errorf("epoch 毫秒锚点偏差过大: got %d, now %d", got, now.UnixMilli())
+	}
+}
+
+func abs64(x int64) int64 { if x < 0 { return -x }; return x }
 
 func (*fakeModel) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
 	return nil, errors.New("未使用")
