@@ -16,8 +16,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cloudwego/eino/components/tool"
-	"github.com/cloudwego/eino/schema"
 	"gopkg.in/yaml.v3"
 
 	"github.com/cnyup/alert-agent/internal/agent"
@@ -160,7 +158,7 @@ func main() {
 		slog.Error("LLM 构造失败", "err", err)
 		os.Exit(1)
 	default:
-		var agentTools []tool.BaseTool
+		var agentTools []agent.Tool
 		// MCP 配置合并：目录式（mcp/<name>.yaml）打底，config.yaml 内联覆盖
 		mcpServers, err := mcpagent.LoadDir(cfg.MCP.Dir)
 		if err != nil {
@@ -789,16 +787,14 @@ func runDistill(st *store.Store, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("蒸馏需要 reasoner（%w）", err)
 	}
-	resp, err := reasoner.Generate(ctx, []*schema.Message{
-		{Role: schema.User, Content: prompt},
-	})
+	content, err := agent.GenerateText(ctx, reasoner, "", prompt)
 	if err != nil {
 		return fmt.Errorf("LLM 生成失败: %w", err)
 	}
 
 	out := "# 剧本修订建议（蒸馏于 " + time.Now().Format("2006-01-02 15:04") + "）\n\n" +
 		"> 由人工反馈自动生成，**未经确认不会生效**：请审阅后手工合并进对应 SKILL.md。\n\n" +
-		resp.Content + "\n"
+		content + "\n"
 	os.MkdirAll("data", 0o755)
 	path := "data/distill-" + time.Now().Format("20060102-150405") + ".md"
 	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
