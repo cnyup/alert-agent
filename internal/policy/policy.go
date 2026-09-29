@@ -26,13 +26,14 @@ func New(st *store.Store, ex Executor) *Manager {
 }
 
 // CreateApprovals 为报告中的 mutating 动作创建 pending 审批。
-// suggest-only 场景由 main 决定是否调用。
+// suggest-only 场景由 main 决定是否调用。幂等：已存在的记录（含终态）
+// 原样保留——重跑报告/崩溃恢复不产生二次审批（PLAN Wave 0.2）。
 func (m *Manager) CreateApprovals(ctx context.Context, rep *coremodel.DiagnosisReport) error {
 	for _, a := range rep.Actions {
 		if a.Risk != coremodel.RiskMutating {
 			continue
 		}
-		if err := m.store.SaveApproval(ctx, store.Approval{
+		if err := m.store.CreateApprovalIfAbsent(ctx, store.Approval{
 			EventID:     rep.AlertID,
 			ActionID:    a.ID,
 			Title:       a.Title,
@@ -49,6 +50,8 @@ func (m *Manager) CreateApprovals(ctx context.Context, rep *coremodel.DiagnosisR
 }
 
 // Decide 处理卡片按钮决策。返回跟进文案（回调层据此发跟进卡片/Toast）。
+// 状态推进原子化（条件 UPDATE）：双击/重投并发下恰好一方推进成功，
+// 失败方收到「已处理过」错误；executor 由推进成功者独占执行。
 func (m *Manager) Decide(ctx context.Context, eventID, actionID string, approve bool, operator string) (string, error) {
 	a, err := m.store.GetApproval(ctx, eventID, actionID)
 	if err != nil {
@@ -59,33 +62,35 @@ func (m *Manager) Decide(ctx context.Context, eventID, actionID string, approve 
 	}
 	now := time.Now().UTC()
 	if !approve {
-		a.Status, a.DecidedAt, a.DecidedBy = "rejected", &now, operator
-		if err := m.store.SaveApproval(ctx, *a); err != nil {
+		ok, err := m.store.TransitionApproval(ctx, eventID, actionID, "rejected", now, operator)
+		if err != nil {
 			return "", err
+		}
+		if !ok {
+			return "", fmt.Errorf("审批已处理过，请勿重复操作")
 		}
 		return fmt.Sprintf("已拒绝：%s（由 %s）", a.Title, operatorMark(operator)), nil
 	}
-	a.Status, a.DecidedAt, a.DecidedBy = "approved", &now, operator
-	if err := m.store.SaveApproval(ctx, *a); err != nil {
+	ok, err := m.store.TransitionApproval(ctx, eventID, actionID, "approved", now, operator)
+	if err != nil {
 		return "", err
 	}
-	// 执行
+	if !ok {
+		return "", fmt.Errorf("审批已处理过，请勿重复操作")
+	}
+	// 执行（仅状态推进成功者到达这里）
 	if m.executor == nil {
-		a.Status = "failed"
-		a.Result = "无执行器（未配置工具）"
-		_ = m.store.SaveApproval(ctx, *a)
-		return "", fmt.Errorf("批准成功但执行失败：%s", a.Result)
+		_ = m.store.FinalizeApproval(ctx, eventID, actionID, "failed", "无执行器（未配置工具）")
+		return "", fmt.Errorf("批准成功但执行失败：无执行器（未配置工具）")
 	}
 	out, err := m.executor(ctx, a.Tool, a.ArgsJSON)
 	if err != nil {
-		a.Status = "failed"
-		a.Result = err.Error()
-		_ = m.store.SaveApproval(ctx, *a)
+		_ = m.store.FinalizeApproval(ctx, eventID, actionID, "failed", err.Error())
 		return "", fmt.Errorf("执行失败：%v", err)
 	}
-	a.Status = "executed"
-	a.Result = out
-	_ = m.store.SaveApproval(ctx, *a)
+	if err := m.store.FinalizeApproval(ctx, eventID, actionID, "executed", out); err != nil {
+		return "", err
+	}
 	return fmt.Sprintf("已批准并执行：%s\n结果：%s", a.Title, out), nil
 }
 

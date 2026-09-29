@@ -263,6 +263,52 @@ func (s *Store) SaveApproval(ctx context.Context, a Approval) error {
 	return nil
 }
 
+// CreateApprovalIfAbsent 幂等创建：已有记录（含终态）原样保留。
+// 审批幂等不变量的写入侧根修——INSERT OR REPLACE 会把 executed/rejected
+// 重置回 pending，导致变更可被二次批准执行（PLAN Wave 0.2 / F3）。
+func (s *Store) CreateApprovalIfAbsent(ctx context.Context, a Approval) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO approvals
+		(event_id, action_id, title, risk, tool, args, status, requested_at, decided_at, decided_by, result)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(event_id, action_id) DO NOTHING`,
+		a.EventID, a.ActionID, a.Title, a.Risk, a.Tool, a.ArgsJSON, a.Status,
+		a.RequestedAt.UTC(), nullableTime(a.DecidedAt), a.DecidedBy, a.Result)
+	if err != nil {
+		return fmt.Errorf("store: 审批幂等创建失败: %w", err)
+	}
+	return nil
+}
+
+// TransitionApproval 原子状态推进：仅当当前状态为 pending 时推进到 newStatus。
+// 返回是否推进成功（false = 已被并发决策处理过）。双击/重投竞态的写入侧根修。
+func (s *Store) TransitionApproval(ctx context.Context, eventID, actionID, newStatus string, decidedAt time.Time, decidedBy string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE approvals SET status=?, decided_at=?, decided_by=?
+		WHERE event_id=? AND action_id=? AND status='pending'`,
+		newStatus, decidedAt.UTC(), decidedBy, eventID, actionID)
+	if err != nil {
+		return false, fmt.Errorf("store: 审批状态推进失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: 审批状态推进读取受影响行失败: %w", err)
+	}
+	return n == 1, nil
+}
+
+// FinalizeApproval 终态落库（approved→executed/failed）。不带 pending 条件：
+// 此刻审批已由本调用方独占（Transition 成功者），直接写结果。
+func (s *Store) FinalizeApproval(ctx context.Context, eventID, actionID, status, result string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE approvals SET status=?, result=? WHERE event_id=? AND action_id=?`,
+		status, result, eventID, actionID)
+	if err != nil {
+		return fmt.Errorf("store: 审批终态落库失败: %w", err)
+	}
+	return nil
+}
+
 // GetApproval 取单条审批。
 func (s *Store) GetApproval(ctx context.Context, eventID, actionID string) (*Approval, error) {
 	row := s.db.QueryRowContext(ctx, `
