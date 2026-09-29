@@ -6,9 +6,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 )
+
+// autoSeq 空 dedupKey 时的自增序号（保证唯一）。
+var autoSeq atomic.Int64
 
 const schemaJobs = `
 CREATE TABLE IF NOT EXISTS jobs (
@@ -46,7 +51,11 @@ type Job struct {
 }
 
 // EnqueueJob 入队（幂等：dedupKey 冲突时已有行原样保留）。
+// dedupKey 为空表示不参与幂等（每次入队独立，用自身唯一性绕过 UNIQUE 约束）。
 func (s *Store) EnqueueJob(ctx context.Context, kind, payload, dedupKey string) (int64, error) {
+	if dedupKey == "" {
+		dedupKey = fmt.Sprintf("auto-%d-%d", time.Now().UnixNano(), autoSeq.Add(1))
+	}
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO jobs (kind, dedup_key, payload, status, available_at, created_at)
 		VALUES (?, ?, ?, 'pending', ?, ?)
@@ -177,4 +186,19 @@ func (s *Store) QueueDepth(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("store: 队列深度查询失败: %w", err)
 	}
 	return n, nil
+}
+
+// ErrQueueFull 队列深度超限（入口 503 依据，不静默丢——来源方按自身节奏重发）。
+var ErrQueueFull = errors.New("store: 队列深度超限")
+
+// EnqueueJobBounded 带深度上限的入队：深度 ≥ maxDepth 返回 ErrQueueFull。
+func (s *Store) EnqueueJobBounded(ctx context.Context, kind, payload, dedupKey string, maxDepth int) (int64, error) {
+	n, err := s.QueueDepth(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if n >= maxDepth {
+		return 0, ErrQueueFull
+	}
+	return s.EnqueueJob(ctx, kind, payload, dedupKey)
 }

@@ -5,12 +5,14 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"sync"
 
+	"github.com/cnyup/alert-agent/internal/store"
 	"github.com/cnyup/alert-agent/pkg/model"
 	"github.com/cnyup/alert-agent/pkg/plugin"
 )
@@ -136,6 +138,8 @@ func (s *source) Start(ctx context.Context, emit plugin.EmitFunc) error {
 			http.Error(w, "read body failed", http.StatusBadRequest)
 			return
 		}
+		// 解析仍用 req ctx（毫秒级）；投递与 req ctx 彻底解耦（F6）：
+		// emit 内部是入队（毫秒级落库），分钟级排查在 dispatch worker 内跑。
 		events, err := s.parser.Parse(req.Context(), body)
 		if err != nil {
 			slog.Warn("webhook 报文解析失败", "path", s.path, "parse", s.parse, "err", err)
@@ -143,19 +147,29 @@ func (s *source) Start(ctx context.Context, emit plugin.EmitFunc) error {
 			return
 		}
 		var firstErr error
+		var queueFull bool
 		for _, evt := range events {
 			if err := evt.Validate(); err != nil {
 				slog.Warn("webhook 事件校验失败", "err", err)
 				firstErr = err
 				continue
 			}
-			if err := emit(req.Context(), evt); err != nil {
+			// 不用 req.Context()：客户端断连不得取消入队（F6 修复）
+			if err := emit(context.Background(), evt); err != nil {
 				slog.Error("webhook 事件投递失败", "id", evt.ID, "err", err)
 				firstErr = err
+				if errors.Is(err, store.ErrQueueFull) {
+					queueFull = true
+				}
 			}
 		}
+		if queueFull {
+			// 队列打满：503 告知来源方按自身节奏重发（不静默丢）
+			http.Error(w, "queue full", http.StatusServiceUnavailable)
+			return
+		}
 		if firstErr != nil {
-			// 已有事件进入管道的照常处理；解析部分失败的以 207 语义告知来源方
+			// 已有事件进入队列的照常处理；解析部分失败的以 207 语义告知来源方
 			w.WriteHeader(http.StatusMultiStatus)
 			return
 		}
