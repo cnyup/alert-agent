@@ -227,3 +227,86 @@ func TestParseReportProseWrapped(t *testing.T) {
 		t.Fatalf("花括号转义场景失败: %v %+v", err, rep2)
 	}
 }
+
+// --- Wave 0.3：token 预算 per-调查（PLAN-CASE-SUPERVISOR §5 Wave 0.3 / F5）---
+
+// meteredFakeModel 每次调用固定报 usage（in=400, out=100，合计 500/次）。
+type meteredFakeModel struct {
+	fakeModel
+}
+
+func (m *meteredFakeModel) Generate(ctx context.Context, msgs []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+	resp, err := m.fakeModel.Generate(ctx, msgs, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if resp != nil {
+		resp.ResponseMeta = &schema.ResponseMeta{
+			Usage: &schema.TokenUsage{PromptTokens: 400, CompletionTokens: 100},
+		}
+	}
+	return resp, nil
+}
+
+// 连续两次 Diagnose：第二次的 Cost.TokensIn 必须独立计量（现状累计 → RED）。
+// 单 Generate/次 的最简形态：第一次 400/100，第二次应仍是 400/100（现状 800/200）。
+func TestDiagnoseTokenBudgetPerCall(t *testing.T) {
+	one := turn{content: `{"summary":"ok","severity":"warning",
+		"root_causes":[{"hypothesis":"h","confidence":0.9,"evidence":["T1"]}],
+		"needs_human":false}`}
+	skill := loadSkill(t)
+	evt, _ := coremodel.NewEvent("t", coremodel.SeverityWarning, "x", nil, time.Now(), nil, nil)
+	r := New(&meteredFakeModel{fakeModel{turns: []turn{one, one}}}, nil, 5, 0)
+
+	rep1, _, err := r.Diagnose(context.Background(), evt, skill, "")
+	if err != nil {
+		t.Fatalf("第一次排查失败: %v", err)
+	}
+	if rep1.Cost.TokensIn != 400 {
+		t.Fatalf("第一次计量应 TokensIn=400，实际 %d", rep1.Cost.TokensIn)
+	}
+	// 同一 Runner（单例）连续第二次排查，消耗第二个 turn
+	rep2, _, err := r.Diagnose(context.Background(), evt, skill, "")
+	if err != nil {
+		t.Fatalf("第二次排查失败: %v", err)
+	}
+	if rep2.Cost.TokensIn != 400 {
+		t.Fatalf("第二次调查应独立计量 TokensIn=400，实际 %d（跨排查累计缺陷 F5）", rep2.Cost.TokensIn)
+	}
+	if rep2.Cost.TokensOut != 100 {
+		t.Fatalf("TokensOut 应独立计量=100，实际 %d", rep2.Cost.TokensOut)
+	}
+}
+
+// maxTokens=600：单次调查内两次 Generate 各报 400/100（每次 advance 500，
+// 累计 500→1000）：第二次 Generate 前累计未超 600 可调用，调用后累计 1000。
+// 第二次排查（新 turn）在 per-call 预算下应正常完成；缺陷实现下开局累计
+// 已 1000≥600 直接熔断 → RED。
+func TestDiagnoseTokenBudgetIndependentCap(t *testing.T) {
+	toolTurn := turn{calls: []schema.ToolCall{
+		{ID: "c1", Function: schema.FunctionCall{Name: "prometheus_query", Arguments: "{}"}},
+	}}
+	finalTurn := turn{content: `{"summary":"ok","severity":"warning",
+		"root_causes":[{"hypothesis":"h","confidence":0.9,"evidence":["T1"]}],
+		"needs_human":false}`}
+	skill := loadSkill(t)
+	evt, _ := coremodel.NewEvent("t", coremodel.SeverityWarning, "x", nil, time.Now(), nil, nil)
+	r := New(&meteredFakeModel{fakeModel{turns: []turn{toolTurn, finalTurn, toolTurn, finalTurn}}},
+		[]tool.BaseTool{&fakeTool{name: "prometheus_query"}}, 5, 600)
+
+	rep1, _, err := r.Diagnose(context.Background(), evt, skill, "")
+	if err != nil {
+		t.Fatalf("第一次排查失败: %v", err)
+	}
+	if rep1.Cost.TokensIn != 800 || rep1.Cost.TokensOut != 200 {
+		t.Fatalf("第一次计量应 800/200（两次 Generate），实际 %d/%d", rep1.Cost.TokensIn, rep1.Cost.TokensOut)
+	}
+	// 第二次排查：per-call 预算下从 0 重新计量，应正常完成
+	rep2, _, err := r.Diagnose(context.Background(), evt, skill, "")
+	if err != nil {
+		t.Fatalf("第二次排查失败（预算被第一次跨排查占用，F5）: %v", err)
+	}
+	if rep2.Cost.TokensIn != 800 {
+		t.Fatalf("第二次独立预算下应正常计量 TokensIn=800，实际 %d", rep2.Cost.TokensIn)
+	}
+}
