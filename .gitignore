@@ -16,3 +16,7 @@ coverage.*
 # env & editor
 .env
 .DS_Store
+
+# local-only skills (synced manually)
+/skills/db_info/
+/skills/workflow_failed/
