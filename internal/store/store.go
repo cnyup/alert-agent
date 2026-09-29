@@ -70,6 +70,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: 初始化 P1 schema 失败: %w", err)
 	}
+	if err := st.ensureJobs(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: 初始化 jobs schema 失败: %w", err)
+	}
 	return st, nil
 }
 
@@ -98,11 +102,11 @@ func (s *Store) GetEvent(ctx context.Context, id string) (*model.AlertEvent, err
 		SELECT id, fingerprint, source, severity, title, description, labels, raw, refs, occurred_at, received_at
 		FROM events WHERE id = ?`, id)
 	var (
-		evt      model.AlertEvent
-		labels   string
-		refs     sql.NullString
-		raw      sql.NullString
-		desc     sql.NullString
+		evt    model.AlertEvent
+		labels string
+		refs   sql.NullString
+		raw    sql.NullString
+		desc   sql.NullString
 	)
 	if err := row.Scan(&evt.ID, &evt.Fingerprint, &evt.Source, &evt.Severity, &evt.Title, &desc,
 		&labels, &raw, &refs, &evt.OccurredAt, &evt.ReceivedAt); err != nil {
