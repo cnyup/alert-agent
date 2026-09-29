@@ -19,6 +19,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/cnyup/alert-agent/internal/agent"
+	"github.com/cnyup/alert-agent/internal/caseflow"
 	"github.com/cnyup/alert-agent/internal/config"
 	"github.com/cnyup/alert-agent/internal/dispatch"
 	einoengine "github.com/cnyup/alert-agent/internal/agent/eino"
@@ -349,6 +350,9 @@ func main() {
 	// feishuSend 由源装配期注入（dedup 命中引用类事件的提示卡发送）
 	var feishuSend func(context.Context, string, string) error
 
+	// supervisor 声明前置（handleEvent 闭包引用；装配在 dispatch 池之后赋值）
+	var supervisor *caseflow.Supervisor
+
 	// 追问续查：回复报告卡片的自由文本 → 带原事件上下文的二次排查（A5）
 	followup = func(ctx context.Context, eventID, question, chatID string) (string, error) {
 		evt, err := st.GetEvent(ctx, eventID)
@@ -484,13 +488,39 @@ func main() {
 			slog.Info("开始排查", "id", evt.ID, "skill", skill.Name, "matched", skill.Name != "generic")
 		}
 
-		report, evidence, err := diagnoser.Diagnose(ctx, evt, skill, extra)
-		// 证据链落 trace（T<n> 编号，报告据此引用）
-		for i, e := range evidence {
-			_ = st.AppendTrace(ctx, evt.ID, store.TraceEntry{
-				Seq: 100 + i, ID: e.ID, Kind: "tool", Name: e.Tool,
-				Input: e.Args, Output: e.Result, At: time.Now().UTC(),
-			})
+		var report *model.DiagnosisReport
+		var evidence []einoengine.Evidence
+		var err error
+		if supervisor != nil {
+			// Case 级多轮编排（caseflow.enabled）：Supervisor 驱动
+			// FINISH/CONTINUE/SWITCH/ESCALATE 循环，最终报告一次成稿。
+			// 逐轮 evidence 已持久化在 case_rounds.delta；trace 侧落最终报告。
+			dc := &caseflow.DomainCase{
+				ID: evt.ID, Fingerprint: evt.Fingerprint, Skill: skill,
+				Event: evt, Extra: extra, CreatedAt: time.Now().UTC(),
+			}
+			outcome, rerr := supervisor.RunCase(ctx, dc)
+			report = outcome.FinalReport
+			if report == nil {
+				report = &model.DiagnosisReport{Summary: "多轮调查未产出报告：" + outcome.Reason}
+			}
+			report.AlertID = evt.ID
+			report.Refs = evt.Refs
+			if rerr != nil {
+				err = rerr
+			}
+			reg.Inc("alert_agent_case_state", string(outcome.State))
+			slog.Info("Case 编排完成", "id", evt.ID, "state", outcome.State,
+				"rounds", dc.Round, "reason", outcome.Reason)
+		} else {
+			report, evidence, err = diagnoser.Diagnose(ctx, evt, skill, extra)
+			// 证据链落 trace（T<n> 编号，报告据此引用）——单轮路径保持原行为
+			for i, e := range evidence {
+				_ = st.AppendTrace(ctx, evt.ID, store.TraceEntry{
+					Seq: 100 + i, ID: e.ID, Kind: "tool", Name: e.Tool,
+					Input: e.Args, Output: e.Result, At: time.Now().UTC(),
+				})
+			}
 		}
 		if err != nil {
 			// 被 resolved 取消属正常收敛：静默退出，不发失败卡打扰
@@ -632,6 +662,43 @@ func main() {
 	pool.Start(ctx)
 	defer pool.Stop()
 
+	// CaseSupervisor（Wave 4，可选启用）：caseflow.enabled=true 时排查走
+	// 多轮编排（FINISH/CONTINUE/SWITCH/ESCALATE）；默认 false 走原单轮路径
+	// （行为等价纪律：多轮是显式开启的新路径）。
+	if cfg.Caseflow.Enabled && diagnoser != nil {
+		investigator := agent.NewInvestigator(diagnoser)
+		supervisor = caseflow.NewSupervisor(
+			caseflow.Config{
+				MaxRounds:       cfg.Caseflow.MaxRounds,
+				JudgeMinConf:    cfg.Caseflow.JudgeMinConf,
+				MaxTokensPerCase: cfg.Caseflow.MaxTokens,
+			},
+			investigator,
+			&caseRouter{selectFn: pickSkill}, // 轮间重选复用入口三级路由
+			nil,
+			st,
+		)
+		// 启动崩溃恢复：stale attempt 回滚 + Case 重新入队
+		go func() {
+			for _, caseID := range supervisor.RecoverCases(ctx, time.Now().UTC().Add(-staleAfter)) {
+				payload, _ := json.Marshal(map[string]string{"case_id": caseID})
+				if _, err := st.EnqueueJob(ctx, "case_round", string(payload), "recover-"+caseID); err != nil {
+					slog.Error("恢复重入队失败", "case", caseID, "err", err)
+				}
+			}
+			pool.Kick()
+		}()
+		pool.Register("case_round", func(ctx context.Context, j *store.Job) error {
+			var in struct{ CaseID string `json:"case_id"` }
+			if err := json.Unmarshal([]byte(j.Payload), &in); err != nil {
+				return err
+			}
+			slog.Info("恢复 Case 重跑", "case", in.CaseID)
+			return nil // v1：恢复 Case 由人工/新告警触发重查（避免无人监督的自动重跑）
+		})
+		slog.Info("CaseSupervisor 就绪", "max_rounds", cfg.Caseflow.MaxRounds)
+	}
+
 	// 源装配与启动
 	for _, sc := range cfg.Sources {
 		src, err := plugin.NewSource(sc.Type, sc.Options)
@@ -687,6 +754,13 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("已退出")
+}
+
+// caseRouter caseflow.Router 适配器：轮间重选复用入口三级路由（pickSkill）。
+type caseRouter struct{ selectFn func(context.Context, *model.AlertEvent) *skills.Skill }
+
+func (r *caseRouter) SelectSkill(ctx context.Context, evt *model.AlertEvent, _ []caseflow.Fact) *skills.Skill {
+	return r.selectFn(ctx, evt)
 }
 
 // ctx0 启动期用的基础 ctx。

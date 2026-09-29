@@ -166,3 +166,9 @@ func (s *Store) RoundAttemptStatus(ctx context.Context, caseID string, round int
 		caseID, round, attemptID).Scan(&status)
 	return status, err
 }
+
+// QueryRowApprovalCount 事件下审批行数（恢复幂等断言用）。
+func (s *Store) QueryRowApprovalCount(ctx context.Context, eventID string) *sql.Row {
+	return s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM approvals WHERE event_id=?`, eventID)
+}

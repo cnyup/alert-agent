@@ -96,6 +96,12 @@ type Config struct {
 		MaxDepth    int `yaml:"max_depth"`    // 队列深度上限，超限入口 503（默认 1000）
 		StaleAfterS int `yaml:"stale_after_s"` // running 判 stale 秒数（默认 600）
 	} `yaml:"dispatch"`
+	Caseflow struct {
+		Enabled      bool    `yaml:"enabled"`        // Case 级多轮编排（默认 false=单轮等价）
+		MaxRounds    int     `yaml:"max_rounds"`     // 轮数上限（默认 3）
+		JudgeMinConf float64 `yaml:"judge_min_conf"` // Judge 触发阈值（默认 0.6）
+		MaxTokens    int64   `yaml:"max_tokens"`     // Case 级 token 预算（<=0 不限）
+	} `yaml:"caseflow"`
 	Store     struct {
 		Path string `yaml:"path"`
 	} `yaml:"store"`
