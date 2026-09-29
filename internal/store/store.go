@@ -74,6 +74,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: 初始化 jobs schema 失败: %w", err)
 	}
+	if err := st.ensureCases(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: 初始化 cases schema 失败: %w", err)
+	}
 	return st, nil
 }
 

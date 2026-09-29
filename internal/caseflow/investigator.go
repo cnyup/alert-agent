@@ -21,7 +21,7 @@ type Fact struct {
 
 // EvidenceRef traces 行引用（不复制内容——Case 视角是 traces 的投影）。
 type EvidenceRef struct {
-	ID    string `json:"id"`    // T<n> 编号
+	ID    string `json:"id"` // T<n> 编号
 	Tool  string `json:"tool"`
 	Round int    `json:"round"`
 }
