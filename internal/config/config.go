@@ -91,6 +91,11 @@ type Config struct {
 		Execution string `yaml:"execution"` // suggest-only | approval-required | auto+whitelist
 	} `yaml:"policy"`
 	Notifiers []NotifierConfig `yaml:"notifiers"`
+	Dispatch  struct {
+		Workers     int `yaml:"workers"`      // 持久队列 worker 数（默认 min(4, NumCPU)）
+		MaxDepth    int `yaml:"max_depth"`    // 队列深度上限，超限入口 503（默认 1000）
+		StaleAfterS int `yaml:"stale_after_s"` // running 判 stale 秒数（默认 600）
+	} `yaml:"dispatch"`
 	Store     struct {
 		Path string `yaml:"path"`
 	} `yaml:"store"`

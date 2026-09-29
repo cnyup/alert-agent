@@ -22,6 +22,7 @@ import (
 
 	"github.com/cnyup/alert-agent/internal/agent"
 	"github.com/cnyup/alert-agent/internal/config"
+	"github.com/cnyup/alert-agent/internal/dispatch"
 	einoengine "github.com/cnyup/alert-agent/internal/agent/eino"
 	"github.com/cnyup/alert-agent/internal/eval"
 	"github.com/cnyup/alert-agent/internal/execenv"
@@ -581,6 +582,58 @@ func main() {
 		return nil
 	}
 
+	// dispatch 池（Wave 2）：SQLite jobs 真源 + worker 池。emit=入队即返回，
+	// 分钟级排查在 worker ctx 内跑，与源侧 ctx（req.Context 等）彻底解耦（F6）。
+	maxDepth := cfg.Dispatch.MaxDepth
+	if maxDepth <= 0 {
+		maxDepth = 1000
+	}
+	staleAfter := time.Duration(cfg.Dispatch.StaleAfterS) * time.Second
+	if staleAfter <= 0 {
+		staleAfter = 10 * time.Minute
+	}
+	pool := dispatch.New(st, dispatch.Options{
+		Workers:    cfg.Dispatch.Workers,
+		StaleAfter: staleAfter,
+		OnJobDone: func(j *store.Job, err error) {
+			if err == nil {
+				reg.Inc("alert_agent_dispatch_done_total", j.Kind)
+			} else {
+				reg.Inc("alert_agent_dispatch_failed_total", j.Kind)
+			}
+		},
+	})
+	pool.Register("webhook_event", func(ctx context.Context, j *store.Job) error {
+		var evt model.AlertEvent
+		if err := json.Unmarshal([]byte(j.Payload), &evt); err != nil {
+			slog.Error("job payload 反序列化失败，置 failed", "id", j.ID, "err", err)
+			return err
+		}
+		return handleEvent(ctx, &evt)
+	})
+	pool.Register("feishu_msg", func(ctx context.Context, j *store.Job) error {
+		var evt model.AlertEvent
+		if err := json.Unmarshal([]byte(j.Payload), &evt); err != nil {
+			slog.Error("job payload 反序列化失败，置 failed", "id", j.ID, "err", err)
+			return err
+		}
+		return handleEvent(ctx, &evt)
+	})
+	emit := func(ctx context.Context, evt *model.AlertEvent) error {
+		payload, err := json.Marshal(evt)
+		if err != nil {
+			return fmt.Errorf("事件序列化失败: %w", err)
+		}
+		// dedup：事件 ID 唯一（重复投递天然去重）
+		if _, err := st.EnqueueJobBounded(ctx, "webhook_event", string(payload), evt.ID, maxDepth); err != nil {
+			return err
+		}
+		pool.Kick()
+		return nil
+	}
+	pool.Start(ctx)
+	defer pool.Stop()
+
 	// 源装配与启动
 	for _, sc := range cfg.Sources {
 		src, err := plugin.NewSource(sc.Type, sc.Options)
@@ -607,9 +660,7 @@ func main() {
 			feishuSend = f.SendFollowUp
 		}
 		go func(name string) {
-			if err := src.Start(ctx, func(ctx context.Context, evt *model.AlertEvent) error {
-				return handleEvent(ctx, evt)
-			}); err != nil && !errors.Is(err, context.Canceled) {
+			if err := src.Start(ctx, emit); err != nil && !errors.Is(err, context.Canceled) {
 				slog.Error("源退出", "type", name, "err", err)
 			}
 		}(sc.Type)
