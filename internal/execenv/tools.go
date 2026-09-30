@@ -41,7 +41,7 @@ func NewReadTool(skillsDir string) (tool.InvokableTool, error) {
 		Truncated bool   `json:"truncated"`
 	}
 	return utils.InferTool("read",
-		"读取剧本目录内的文件内容（相对路径，如 tt-devops-shared/SKILL.md 或 tt-telemetry-log/references/logs-query.md）。用于按需加载技能文档与 references；目录外的路径一律拒绝。",
+		"读取剧本目录内的文件内容（相对路径，如 shared-docs/SKILL.md 或 telemetry-logs/references/logs-query.md）。用于按需加载技能文档与 references；目录外的路径一律拒绝。",
 		func(_ context.Context, in struct {
 			Path string `json:"path" jsonschema:"required" jsonschema_description:"相对剧本目录的文件路径"`
 		}) (output, error) {
