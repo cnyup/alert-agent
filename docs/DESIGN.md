@@ -321,7 +321,7 @@ alert-agent/
 │   └── plugin/               # Source/Notifier/Stage 接口 + 注册函数（公开）
 ├── config.yaml
 ├── skills/examples/          # 示例剧本（pg-conn-exhaust 等）
-└── Makefile                  # build / test / lint（远程 yup-dev 上执行）
+└── Makefile                  # build / test / lint（远程构建机上执行）
 ```
 
 `pkg/` 只放插件作者需要引用的契约与接口；其余实现全部 `internal/`。

@@ -13,10 +13,10 @@ curl -sI --max-time 5 https://api.siliconflow.cn | head -1
 hostname -I
 ```
 
-## 1. 构建交付包（在构建机上，如 yup-dev）
+## 1. 构建交付包（在构建机上）
 
 ```bash
-cd /root/code/alert-agent && git pull
+cd <repo-path> && git pull
 make release          # 产出 dist/alert-agent-<日期>-linux-amd64.tar.gz
 ```
 
