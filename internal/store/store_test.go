@@ -169,7 +169,9 @@ func TestJobsStaleReclaimAndLateFinishRejected(t *testing.T) {
 	if err != nil || j == nil {
 		t.Fatalf("claim: %v %v", err, j)
 	}
-	// stale 回收（claimed_at 已过期）
+	// stale 回收：阈值 1ms + 显式越过（SQLite TIMESTAMP 往返精度可能截断到
+	// 毫秒以下，同 tick 时 claimed_at < cutoff 不成立——快机器上稳定复现）
+	time.Sleep(5 * time.Millisecond)
 	ids, err := s.ReclaimStaleJobs(ctx, time.Millisecond, 3)
 	if err != nil {
 		t.Fatal(err)
@@ -189,14 +191,16 @@ func TestJobsStaleReclaimAndLateFinishRejected(t *testing.T) {
 	if j2.Attempts != 2 {
 		t.Fatalf("attempts 应累加到 2，实际 %d", j2.Attempts)
 	}
-	// 超限后置 failed
-	if _, err := s.ReclaimStaleJobs(ctx, 0, 1); err != nil {
+	// 超限后置 failed（显式越过阈值，理由同上）
+	time.Sleep(5 * time.Millisecond)
+	if _, err := s.ReclaimStaleJobs(ctx, time.Millisecond, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.FinishJob(ctx, j2.ID, "done"); err != nil {
 		t.Fatal(err)
 	}
-	ids2, err := s.ReclaimStaleJobs(ctx, 0, 1)
+	time.Sleep(5 * time.Millisecond)
+	ids2, err := s.ReclaimStaleJobs(ctx, time.Millisecond, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
