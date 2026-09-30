@@ -17,13 +17,8 @@ coverage.*
 .env
 .DS_Store
 
-# local-only skills (synced manually)
-/skills/db_info/
-/skills/workflow_failed/
-/skills/tt-database/
-/skills/tt-devops-shared/
-/skills/tt-telemetry-alert/
-/skills/tt-telemetry-log/
-/skills/tt-telemetry-metric/
+# local-only skills (synced manually, 真源在 ~/.agents/skills/)
+/skills/*
+!/skills/examples/
 # runtime workflow doc (internal hosts/paths)
 /AGENTS.md
