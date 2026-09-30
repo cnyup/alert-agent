@@ -25,3 +25,5 @@ coverage.*
 /skills/tt-telemetry-alert/
 /skills/tt-telemetry-log/
 /skills/tt-telemetry-metric/
+# runtime workflow doc (internal hosts/paths)
+/AGENTS.md
