@@ -1,9 +1,9 @@
 # 按 https://sso.example.com/index/devops-cli/image-example 官方示例：
-# token 不进镜像层，运行时经 TT_YW_AUTHORIZATION 注入
+# token 不进镜像层，运行时经 OPS_CLI_TOKEN 注入
 FROM debian:bookworm-slim
 
-ARG TT_DEVOPS_VERSION=1.0.15
-ARG TT_DEVOPS_PLATFORM=linux-arm64
+ARG CLI_VERSION=1.0.15
+ARG CLI_PLATFORM=linux-arm64
 
 ENV PATH="/root/.ops-cli/bin:${PATH}"
 
@@ -13,7 +13,7 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /root/.ops-cli/bin; \
     curl -fsSL -o /root/.ops-cli/bin/ops-cli \
-      "https://assets.example.com/assets/ops-cli/${TT_DEVOPS_VERSION}/${TT_DEVOPS_PLATFORM}/ops-cli"; \
+      "https://assets.example.com/assets/ops-cli/${CLI_VERSION}/${CLI_PLATFORM}/ops-cli"; \
     chmod +x /root/.ops-cli/bin/ops-cli; \
     ops-cli --version
 
