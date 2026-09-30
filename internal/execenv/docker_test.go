@@ -11,12 +11,12 @@ import (
 
 // TestDockerBackendStdin 真实 Docker 沙箱验证（默认跳过）：
 //
-//	TT_DOCKER_TEST=1 go test ./internal/execenv/ -run TestDockerBackend
+//	SANDBOX_E2E_TEST=1 go test ./internal/execenv/ -run TestDockerBackend
 //
-// 需要：本机 dockerd、镜像 ops-cli-sandbox、TT_YW_AUTHORIZATION 环境变量。
+// 需要：本机 dockerd、镜像 ops-cli-sandbox、OPS_CLI_TOKEN 环境变量。
 func TestDockerBackend(t *testing.T) {
-	if os.Getenv("TT_DOCKER_TEST") != "1" {
-		t.Skip("设 TT_DOCKER_TEST=1 启用（需 Docker 与沙箱镜像）")
+	if os.Getenv("SANDBOX_E2E_TEST") != "1" {
+		t.Skip("设 SANDBOX_E2E_TEST=1 启用（需 Docker 与沙箱镜像）")
 	}
 	var c config.ToolsConfig
 	c.Exec.Enabled = true
@@ -30,7 +30,7 @@ func TestDockerBackend(t *testing.T) {
 	c.Exec.MaxOutputBytes = 65536
 	c.Exec.Docker.Image = "ops-cli-sandbox:1.0.15"
 	c.Exec.Docker.Timeout = "60s"
-	c.Exec.Docker.Env = []string{"TT_YW_AUTHORIZATION=" + os.Getenv("TT_YW_AUTHORIZATION")}
+	c.Exec.Docker.Env = []string{"OPS_CLI_TOKEN=" + os.Getenv("OPS_CLI_TOKEN")}
 
 	f, err := NewFactory(c)
 	if err != nil {
@@ -70,7 +70,7 @@ func TestDockerBackend(t *testing.T) {
 		t.Fatalf("stdin: err=%v res=%+v", err, res)
 	}
 	// CLI 真实调用（需 token）
-	if os.Getenv("TT_YW_AUTHORIZATION") != "" {
+	if os.Getenv("OPS_CLI_TOKEN") != "" {
 		res, err = gated.Run(ctx,
 			[]string{"ops-cli", "databases", "+doctor"}, "")
 		if err != nil || strings.Contains(res.Stdout, `"success": false`) {
@@ -83,6 +83,6 @@ func TestDockerBackend(t *testing.T) {
 			t.Fatalf("resources+stdin: err=%v stdout=%.300s stderr=%.200s", err, res.Stdout, res.Stderr)
 		}
 	} else {
-		t.Log("TT_YW_AUTHORIZATION 未设置，跳过 CLI 真实调用断言")
+		t.Log("OPS_CLI_TOKEN 未设置，跳过 CLI 真实调用断言")
 	}
 }

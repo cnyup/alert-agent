@@ -97,7 +97,7 @@ make eval-full    # 完整档，每 case 一次真实排查，改剧本时跑
 ./bin/alert-agent -config config.yaml -eval route|full     # 剧本评测
 ```
 
-沙箱镜像（docker 后端）：`deploy/sandbox/Dockerfile`（官方 CLI 装入 debian slim，`TT_YW_AUTHORIZATION` 运行时注入）。
+沙箱镜像（docker 后端）：`deploy/sandbox/Dockerfile`（CLI 装入 debian slim，凭证运行时经容器 env 注入——变量名按业务实际配置，如 `OPS_CLI_TOKEN`）。
 部署：`deploy/alert-agent.service`（systemd）或 `Dockerfile`。
 
 ## 扩展模型（一切可插拔）

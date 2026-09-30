@@ -91,7 +91,7 @@ tools:                            # 内置框架工具（技能文档即调用�
       memory_mb: 512
       cpu: 1.0
       timeout: 30s
-      env: []                     # 注入容器的环境变量，如 ["TT_YW_AUTHORIZATION=${TT_YW_AUTHORIZATION}"]
+      env: []                     # 注入容器的环境变量，如 ["OPS_CLI_TOKEN=${OPS_CLI_TOKEN}"]（变量名按业务实际调整）
   read:
     enabled: true                 # 限定剧本目录内读文件（references 按需加载）
 
