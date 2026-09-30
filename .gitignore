@@ -20,3 +20,8 @@ coverage.*
 # local-only skills (synced manually)
 /skills/db_info/
 /skills/workflow_failed/
+/skills/tt-database/
+/skills/tt-devops-shared/
+/skills/tt-telemetry-alert/
+/skills/tt-telemetry-log/
+/skills/tt-telemetry-metric/
