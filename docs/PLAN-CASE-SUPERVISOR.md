@@ -18,7 +18,7 @@
 
 | # | 事实 | 锚点 | 验证方式 |
 |---|------|------|----------|
-| F1 | 全量测试绿：`go test ./...` 21 包通过（yup-dev） | 本会话 job eb0b028f | 远程实测 exit 0 |
+| F1 | 全量测试绿：`go test ./...` 21 包通过（远程主机） | 本会话 job eb0b028f | 远程实测 exit 0 |
 | F2 | SQLite 已开 WAL + busy_timeout(5000)，多 worker 条件 UPDATE claim 恰好 1 人成功 | store.go:60 | 探针实测（4 goroutine 并发抢 1 行，winners=1） |
 | F3 | **缺陷**：`SaveApproval` 用 `INSERT OR REPLACE`，重跑会把已 executed 审批重置回 pending → 变更可被二次批准执行 | store.go:255 + policy.go:43-60 | 探针实测复现（RED） |
 | F4 | **缺陷**：`Decide` 读-判-写非原子，双击/重投并发可双执行变更 | policy.go:69-101 | 代码路径确认（未构造并发复现） |
@@ -29,7 +29,7 @@
 | F9 | store 全参数化 SQL 无注入，但零事务（Begin/Tx 零命中） | store.go 全文 | grep 实测 |
 | F10 | **git 索引脏**：暂存区是 v0.6 前旧快照（19 staged + 27 deleted 假象），磁盘=HEAD=最新。直接 commit 会回退约 4000 行 | 本会话 git-status 注入块 | 跨会话记忆 + 状态注入块 |
 | F11 | 飞书 WS SDK 每消息一 goroutine（`go c.handleMessageTask`），长回调不阻塞其他消息，但并发排查无上限 | SDK client_message.go:34 | 远程读 SDK 源码 |
-| F12 | yup-dev 磁盘紧张：清 2G 构建缓存后仅 441M 可用（40G 盘 99% 满） | df 实测 | 远程实测 |
+| F12 | 远程主机磁盘紧张：清 2G 构建缓存后仅 441M 可用（40G 盘 99% 满） | df 实测 | 远程实测 |
 
 **Eino 能力边界**（外部核验，cloudwego 官方文档 2026-03）：compose CheckPointStore 可插拔、序列化 v0.3.26 后稳定——技术可用但**明确不用**（见 §4 拒绝清单）；仓库锁定 eino v0.9.19（go.mod:6）。
 
@@ -133,11 +133,11 @@ flowchart TD
 
 ## 5. 实施波次
 
-> 执行环境纪律（AGENTS.md）：构建/测试/git 全部在远程 `yup-dev` 执行（`ssh yup-dev "cd /root/code/alert-agent && <cmd>"`）；改本地文件后 `mutagen sync flush alert-agent`；禁止本地 git 写操作。**磁盘仅 441M 可用（F12）**：开工前先 `ssh yup-dev "df -h /"`，低于 2G 先清 `go clean -cache` 或提醒用户清理 `/root/code/yup-mark`（8.9G，需用户确认）。
+> 执行环境纪律（AGENTS.md）：构建/测试/git 全部在远程主机执行（`ssh <remote-host> "cd <repo-path> && <cmd>"`）；改本地文件后 `mutagen sync flush alert-agent`；禁止本地 git 写操作。**磁盘仅 441M 可用（F12）**：开工前先 `ssh <remote-host> "df -h /"`，低于 2G 先清 `go clean -cache` 或提醒用户清理 `<other-project-dir>`（8.9G，需用户确认）。
 
 ### Wave 0 — 前置修复（阻断项，不修不许动架构）
 
-- [ ] **0.1 清理脏 git 索引**。现状见 F10。处理：`ssh yup-dev "cd /root/code/alert-agent && git reset"`（仅重置索引，不碰工作树）——`git reset` 属破坏性命令类别，**执行前必须向用户确认一次**。验证：`git status` 后 staged 清空、工作树文件与 HEAD 内容一致（抽查 `git diff` 为空、untracked 保持）。
+- [ ] **0.1 清理脏 git 索引**。现状见 F10。处理：`ssh <remote-host> "cd <repo-path> && git reset"`（仅重置索引，不碰工作树）——`git reset` 属破坏性命令类别，**执行前必须向用户确认一次**。验证：`git status` 后 staged 清空、工作树文件与 HEAD 内容一致（抽查 `git diff` 为空、untracked 保持）。
 - [ ] **0.2 审批幂等 + 双击竞态修复（RED→GREEN）**。
   - 先写失败测试（放 `internal/policy/policy_test.go` 或 store_test.go）：
     - T1 幂等：预置 `executed` 审批 → 调 `CreateApprovals` 重建 → 断言状态仍 executed、decided_by/result 未被清空（即 F3 探针场景的固化）；
@@ -149,7 +149,7 @@ flowchart TD
   - 先写失败测试（budget_test.go）：同一 Runner 连续两次 `Diagnose`（fake model 各报 usage 500），断言第二次报告 `Cost.TokensIn==500`（现状会累计到 1000 → RED）；再断言 `maxTokens=800` 时第二次调查独立生效（第一次耗 600 后第二次仍可跑 600 而非只剩 200）。
   - 修法：计量下沉为 per-`Diagnose` 实例——`Diagnose` 内构造 `newTokenModel(reasoner, maxTokens)` 包装后传给引擎，Runner 不再持有 meter（或 meter 每次 reset，但 per-call 实例更干净，无共享可变状态）。
   - 验证：`go test ./internal/agent/ -count=1` + 全量回归。
-- [ ] Wave 0 收口：`ssh yup-dev "cd /root/code/alert-agent && go build ./... && go test ./... -count=1"` 全绿后，三个修复各自独立 commit（fix: 前缀）。
+- [ ] Wave 0 收口：`ssh <remote-host> "cd <repo-path> && go build ./... && go test ./... -count=1"` 全绿后，三个修复各自独立 commit（fix: 前缀）。
 
 ### Wave 1 — store 基建：事务 + jobs 表 + claim/回收
 
@@ -277,8 +277,8 @@ CREATE TABLE IF NOT EXISTS case_rounds (
 
 ## 8. 交接备注（给执行 agent）
 
-- 执行环境见 AGENTS.md：一切 build/test/git 在 `ssh yup-dev`；本机只改文件 + `mutagen sync flush alert-agent`；`.conflict` 文件停下报告用户。
-- 每个波次收口跑全量：`ssh yup-dev "cd /root/code/alert-agent && go build ./... && go test ./... -count=1"`；提交按逻辑单元拆分，message 前缀 fix/feat/refactor，**永不 amend**。
-- Wave 0.1 的 `git reset` 与任何磁盘清理涉及他人目录（`/root/code/yup-mark`）时，先向用户确认再动手。
-- yup-dev 磁盘 441M 可用是持续风险（F12）：每次全量测试前瞄一眼 `df -h /`，低于 2G 先 `go clean -cache`。
+- 执行环境见 AGENTS.md：一切 build/test/git 在远程主机（见 AGENTS.md）；本机只改文件 + `mutagen sync flush alert-agent`；`.conflict` 文件停下报告用户。
+- 每个波次收口跑全量：`ssh <remote-host> "cd <repo-path> && go build ./... && go test ./... -count=1"`；提交按逻辑单元拆分，message 前缀 fix/feat/refactor，**永不 amend**。
+- Wave 0.1 的 `git reset` 与任何磁盘清理涉及他人目录（`<other-project-dir>`）时，先向用户确认再动手。
+- 远程主机磁盘紧张是持续风险（F12，441M 可用时实测）：每次全量测试前瞄一眼 `df -h /`，低于 2G 先 `go clean -cache`。
 - 本文档与 DESIGN.md 冲突时，以本文档为准（Wave 5 会把差异写回 DESIGN）。
